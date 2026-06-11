@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.env
+*.log
+log/
+logs/
+cache/
+/tmp/
+*.part
+*.checkpoint
+.DS_Store
