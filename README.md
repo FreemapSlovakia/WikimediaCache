@@ -91,6 +91,36 @@ A powerful background task that scans all downloaded thumbnails and deletes thos
 **Response**:
 Returns `202 Accepted` immediately. The cleanup task runs asynchronously in the background.
 
+### Idle cache warmer
+
+While the service is idle (no active user-driven prefetch demand), a background job downloads **one fresh thumbnail per tick** (default: every `WARM_CACHE_INTERVAL_MS` = 1000ms), so the cache is already warm by the time a real user pans there. Real traffic always takes priority - the warmer pauses immediately whenever the prefetch queue is non-empty.
+
+Within a tick, already-cached candidates are skipped immediately (no waiting) until one that actually needs downloading is found - the 1-second pacing only applies *between* actual downloads, not between checks. So once a region is fully warm and only the odd new photo trickles in, it still ends up cached almost immediately instead of being throttled to "maybe once every N seconds" by how many already-cached IDs happen to precede it.
+
+It walks the dataset by `page_id` ascending (not random) within the current stage's bbox - coordinates are scattered geographically regardless of `page_id` order, so this already gives effectively random coverage without the cost of `ORDER BY random()` on every tick.
+
+**Staged escalation**: warming starts with the small, high-priority `BBOX_SVK` bbox, then `BBOX_V4` (Slovakia + Czechia + Poland + Hungary), then `BBOX_EU` (all of Europe) - each stage advances to the next once it completes a full lap (cursor reaches the end and wraps around). Each stage after the first spatially excludes the bbox(es) already covered by earlier stages (`AND NOT (location && ...)`) so that region is never even fetched again, not just skipped. `BBOX_EU` is the final stage (never advances further) - add more entries to `WARM_CACHE_STAGES` in `src/index.ts` if an even wider scope is ever needed.
+
+State (current stage, cursor, lap count) is persisted to `warm_cache.checkpoint` every 60s so a restart resumes instead of starting over.
+
+`importDump.ts` automatically resets the warmer back to stage 0 (SVK) after each successful monthly import, via a localhost-only `GET /warm-cache-reset` call to the running server - a fresh dump may contain newly-added Slovak photos, so warming should re-scan SVK rather than continuing wherever it happened to be (possibly deep into the V4/EU stage already). This is best-effort: if the server isn't running when the import script runs, it just logs a warning and continues.
+
+Configure via `.env`:
+```env
+WARM_CACHE_ENABLED=true
+WARM_CACHE_INTERVAL_MS=1000
+BBOX_V4="12.0,45.7,24.2,55.0"
+BBOX_EU="-25,34,45,71"
+```
+
+At the default interval that's up to 3600 thumbnails/hour while fully idle - negligible load on Wikimedia. Progress is visible in `/status` (`warmCacheDownloadedCount`, `warmCacheSkippedCount`, `warmCacheStage`, `warmCacheLaps`, `warmCacheCursor`) and `/metrics`.
+
+Logged to the server's log file (`LOG_FILE`, default `wikimedia_errors.log`, not `logs/import.log` - that one is import-only, see above):
+- Every time a stage's bbox completes a full lap (`Completed lap N of stage 'svk'.`) and whenever it advances to the next stage (`Advancing to stage 'v4'.`) - so you can tell exactly when SVK (and later V4) has been fully pre-warmed.
+- A daily digest (`Daily summary: pre-warmed N thumbnails in the last 24h ...`) so warming throughput is easy to eyeball over time without counting individual lines.
+
+Once V4 finishes a full lap too, adding an even wider stage (e.g. all of Europe) is a one-line addition to `WARM_CACHE_STAGES` - no other changes needed.
+
 ### 6. Metrics (Prometheus)
 
 ```http
@@ -173,6 +203,16 @@ If `api_keys.txt` is missing or empty, the server will reject all API requests w
 
 The table and spatial index are created automatically on first start.
 
+## Cache storage (sharded)
+
+Thumbnails are stored on disk under `cache/<shard>/<pageId>_<size>.jpg`, where `<shard>` is `pageId % 1000` zero-padded to 3 digits (`000`-`999`) - see `src/cachePaths.ts`. A single flat directory doesn't scale well once the [idle cache warmer](#idle-cache-warmer)'s staged SVK -> V4 -> EU escalation pushes the file count into the hundreds of thousands or millions: `readdir()`/`stat()` passes (used by `/status`, `/metrics`, cleanup, migration) get noticeably slower, and `/status` in particular is polled frequently by uptime monitoring. Sharding keeps each directory's file count to roughly 1/1000th of the total.
+
+**If upgrading from an older, unsharded cache** (files sitting directly in `cache/`), run the one-time migration **before** starting the server:
+```bash
+npm run migrate-cache-shards
+```
+It moves existing files into their shard subdirectories (safe to re-run; only touches files still directly in `cache/`). A fresh/empty cache needs no migration - shard subdirectories are created automatically on startup.
+
 ## Running the server
 
 ```bash
@@ -204,6 +244,7 @@ This script includes several advanced mechanisms to ensure reliability:
   ```
 - **Deduplication (ON CONFLICT protection)**: The SQL dump often contains duplicate photos sequentially. The script deduplicates batches before sending them to PostgreSQL, protecting the database from `ON CONFLICT` row update errors.
 - **Automatic Cache Cleanup**: After the database import completes, the script scans the `/cache` directory. It cross-references all downloaded thumbnails with the newly imported database records. Any thumbnail whose `page_id` no longer exists in the updated Wikimedia dump (e.g., deleted images) is automatically unlinked and permanently deleted from the disk to free up space.
+- **Import Log**: Every run appends timestamped `INFO`/`WARN`/`ERROR` lines to `logs/import.log` (start/end markers, resume points, record counts, errors) - independent of whatever shell redirection you use to run it, so you always have a durable record of the last run's outcome. After each successful import it logs the total photo count and how many of those are within Slovakia (`BBOX_SVK`), and it also resets the [idle cache warmer](#idle-cache-warmer) back to the SVK stage since the fresh dump may include new Slovak photos.
 
 ## Updating data
 

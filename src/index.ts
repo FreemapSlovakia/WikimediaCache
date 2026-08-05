@@ -16,11 +16,25 @@ import { Agent as HttpAgent } from 'http';
 import { Agent as HttpsAgent } from 'https';
 import sharp from 'sharp';
 import crypto from 'crypto';
+import {
+  CACHE_DIR,
+  ensureShardDirsExist,
+  getCachePath,
+  listCacheFilesRecursive,
+} from './cachePaths.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config();
 
 const app = new Koa();
+// The service sits behind nginx (proxy_pass to 127.0.0.1), which already
+// sets X-Real-IP/X-Forwarded-For correctly - but without this flag Koa
+// ignores those headers entirely and ctx.request.ip always resolves to the
+// proxy's own loopback address, NOT the real client. That silently broke
+// the "localhost only" checks on /cleanup-cache and /warm-cache-reset -
+// every request arriving through nginx looked local to Koa, regardless of
+// where it actually came from.
+app.proxy = true;
 const router = new Router();
 
 const pkgPath = path.join(__dirname, '../package.json');
@@ -80,6 +94,12 @@ class Semaphore {
 const concurrency = process.env.DOWNLOAD_CONCURRENCY ? parseInt(process.env.DOWNLOAD_CONCURRENCY, 10) : 2;
 const downloadSemaphore = new Semaphore(concurrency);
 const BOT_UA = process.env.USER_AGENT || 'FreemapCacheBot/1.0 (https://freemap.sk; freemap@freemap.sk)';
+const WIKIMEDIA_ACCESS_TOKEN = process.env.WIKIMEDIA_ACCESS_TOKEN || '';
+
+const commonHeaders: Record<string, string> = { 'User-Agent': BOT_UA };
+if (WIKIMEDIA_ACCESS_TOKEN) {
+  commonHeaders['Authorization'] = `Bearer ${WIKIMEDIA_ACCESS_TOKEN}`;
+}
 
 const httpAgent = new HttpAgent({ keepAlive: true });
 const httpsAgent = new HttpsAgent({ keepAlive: true });
@@ -139,7 +159,7 @@ async function downloadThumbnailToCache(pageId: string, size: number, cachePath:
   const apiUrl = `https://commons.wikimedia.org/w/api.php?action=query&prop=imageinfo&iiprop=url&iiurlwidth=${size}&pageids=${pageId}&format=json`;
   let apiResponse: any;
   try {
-    apiResponse = await customGot.get(apiUrl, { headers: { 'User-Agent': BOT_UA } }).json();
+    apiResponse = await customGot.get(apiUrl, { headers: commonHeaders }).json();
   } catch (err: any) {
     if (err.response?.statusCode === 429) {
       writeLog(`[prefetch] === API BLOCKED AFTER ${successfulDownloadsSinceLastBlock} SUCCESSFUL DOWNLOADS ===`);
@@ -171,7 +191,7 @@ async function downloadThumbnailToCache(pageId: string, size: number, cachePath:
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       const buffer = await customGot.get(thumbUrl, {
-        headers: { 'User-Agent': BOT_UA, 'Accept': 'image/jpeg,image/png,*/*;q=0.5' },
+        headers: { ...commonHeaders, 'Accept': 'image/jpeg,image/png,*/*;q=0.5' },
         timeout: { request: 30000 },
         retry: { limit: 0 },
       }).buffer();
@@ -220,7 +240,7 @@ async function runPrefetchWorker() {
       prefetchQueued.delete(pageId);
       const fileName = `${pageId}_120.jpg`;
       if (validCacheEntries.has(fileName)) continue;
-      const cachePath = path.join(CACHE_DIR, fileName);
+      const cachePath = getCachePath(pageId, 120);
       await downloadSemaphore.acquire();
       try {
         await downloadThumbnailToCache(pageId, 120, cachePath);
@@ -262,9 +282,32 @@ function snapToStandardSize(requested: number): number {
   );
 }
 
-const CACHE_DIR = path.join(__dirname, '../cache');
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
+async function getCacheDirStats(): Promise<{ fileCount: number; totalSize: number }> {
+  let fileCount = 0;
+  let totalSize = 0;
+  try {
+    const files = await listCacheFilesRecursive();
+    fileCount = files.length;
+    for (const relPath of files) {
+      const stats = await fs.promises.stat(path.join(CACHE_DIR, relPath)).catch(() => null);
+      if (stats) totalSize += stats.size;
+    }
+  } catch (err) {
+    console.error('Error reading cache dir stats', err);
+  }
+  return { fileCount, totalSize };
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+  return `${value.toFixed(1)}${units[unitIndex]}`;
 }
 
 const activeClients = new Map<string, number>();
@@ -280,20 +323,7 @@ router.get('/status', async (ctx) => {
     if (now - lastSeen > 24 * 60 * 60 * 1000) activeClients.delete(id);
   }
 
-  let fileCount = 0;
-  let totalSize = 0;
-  try {
-    const files = await fs.promises.readdir(CACHE_DIR);
-    fileCount = files.length;
-    for (const file of files) {
-      const stats = await fs.promises.stat(path.join(CACHE_DIR, file)).catch(() => null);
-      if (stats) {
-        totalSize += stats.size;
-      }
-    }
-  } catch (err) {
-    console.error('Error reading cache dir for status', err);
-  }
+  const { fileCount, totalSize } = await getCacheDirStats();
 
   let dbRowsEstimate = 0;
   try {
@@ -316,7 +346,13 @@ router.get('/status', async (ctx) => {
     cacheMissesCount,
     deadFilesCount,
     apiErrorCount,
-    dbPhotosCount: dbRowsEstimate
+    dbPhotosCount: dbRowsEstimate,
+    warmCacheEnabled: WARM_CACHE_ENABLED,
+    warmCacheDownloadedCount,
+    warmCacheSkippedCount,
+    warmCacheStage: WARM_CACHE_STAGES[warmCacheState.stageIndex]?.name,
+    warmCacheLaps: warmCacheState.laps,
+    warmCacheCursor: warmCacheState.cursor
   };
 });
 
@@ -326,16 +362,7 @@ router.get('/metrics', async (ctx) => {
     if (now - lastSeen > 24 * 60 * 60 * 1000) activeClients.delete(id);
   }
 
-  let fileCount = 0;
-  let totalSize = 0;
-  try {
-    const files = await fs.promises.readdir(CACHE_DIR);
-    fileCount = files.length;
-    for (const file of files) {
-      const stats = await fs.promises.stat(path.join(CACHE_DIR, file)).catch(() => null);
-      if (stats) totalSize += stats.size;
-    }
-  } catch (err) {}
+  const { fileCount, totalSize } = await getCacheDirStats();
 
   let dbRowsEstimate = 0;
   try {
@@ -380,6 +407,22 @@ wikimedia_dead_files_total ${deadFilesCount}
 # HELP wikimedia_prefetch_queue_length Number of items waiting to be downloaded
 # TYPE wikimedia_prefetch_queue_length gauge
 wikimedia_prefetch_queue_length ${prefetchQueue.length}
+
+# HELP wikimedia_warm_cache_downloaded_total Total number of thumbnails downloaded by the idle cache warmer
+# TYPE wikimedia_warm_cache_downloaded_total counter
+wikimedia_warm_cache_downloaded_total ${warmCacheDownloadedCount}
+
+# HELP wikimedia_warm_cache_skipped_total Total number of already-cached thumbnails skipped by the idle cache warmer
+# TYPE wikimedia_warm_cache_skipped_total counter
+wikimedia_warm_cache_skipped_total ${warmCacheSkippedCount}
+
+# HELP wikimedia_warm_cache_stage_index Index of the current warm-cache bbox stage (0 = svk, 1 = v4, ...)
+# TYPE wikimedia_warm_cache_stage_index gauge
+wikimedia_warm_cache_stage_index ${warmCacheState.stageIndex}
+
+# HELP wikimedia_warm_cache_laps Number of full laps completed of the current warm-cache stage's bbox
+# TYPE wikimedia_warm_cache_laps gauge
+wikimedia_warm_cache_laps ${warmCacheState.laps}
 `.trim() + '\n';
 });
 
@@ -427,7 +470,8 @@ router.get('/pictures', async (ctx) => {
     if (ctx.query['prefetch'] === 'true' && typeof clientId === 'string') {
       enqueuePrefetch(rows.map(r => String(r.pageId)), clientId);
     }
-  } catch (error) {
+  } catch (error: any) {
+    writeErrorLog(`[/pictures] DB query failed for bbox ${bbox}: ${error.message}`);
     ctx.status = 500;
   }
 });
@@ -441,7 +485,7 @@ router.get('/wikimedia/thumbnail/:pageId', async (ctx) => {
   }
   const size = snapToStandardSize(parseInt(ctx.query['size'] as string) || 120);
   const fileName = `${pageId}_${size}.jpg`;
-  const cachePath = path.join(CACHE_DIR, fileName);
+  const cachePath = getCachePath(pageId, size);
 
   const clientId = ctx.query['clientId'] as string;
   if (clientId) activeClients.set(clientId, Date.now());
@@ -470,15 +514,15 @@ router.get('/wikimedia/thumbnail/:pageId', async (ctx) => {
 
 async function runSpatialCleanup(minLon: number, minLat: number, maxLon: number, maxLat: number, mode: 'inside' | 'outside') {
   console.log(`[cleanup] Starting spatial cleanup (mode: ${mode}) for bbox: ${minLon},${minLat},${maxLon},${maxLat}`);
-  const files = await fs.promises.readdir(CACHE_DIR);
-  const fileMap = new Map<number, string[]>();
-  
-  for (const file of files) {
-    if (!file.endsWith('.jpg')) continue;
-    const pageId = parseInt(file.split('_')[0]!, 10);
+  const files = await listCacheFilesRecursive(); // relative paths, e.g. "042/1234567_120.jpg"
+  const fileMap = new Map<number, string[]>(); // pageId -> relative paths
+
+  for (const relPath of files) {
+    const baseName = path.basename(relPath);
+    const pageId = parseInt(baseName.split('_')[0]!, 10);
     if (!isNaN(pageId)) {
       if (!fileMap.has(pageId)) fileMap.set(pageId, []);
-      fileMap.get(pageId)!.push(file);
+      fileMap.get(pageId)!.push(relPath);
     }
   }
 
@@ -503,11 +547,11 @@ async function runSpatialCleanup(minLon: number, minLat: number, maxLon: number,
         const shouldDelete = mode === 'inside' ? isInside : !isInside;
         
         if (shouldDelete) {
-          for (const file of fileMap.get(id)!) {
-            const cachePath = path.join(CACHE_DIR, file);
+          for (const relPath of fileMap.get(id)!) {
+            const cachePath = path.join(CACHE_DIR, relPath);
             if (fs.existsSync(cachePath)) {
               fs.unlinkSync(cachePath);
-              validCacheEntries.delete(file);
+              validCacheEntries.delete(path.basename(relPath));
               deletedCount++;
             }
           }
@@ -522,20 +566,21 @@ async function runSpatialCleanup(minLon: number, minLat: number, maxLon: number,
 
 async function runFullCleanup() {
   console.log('[cleanup] Starting full cache wipe...');
-  let deletedCount = 0;
   try {
-    const files = await fs.promises.readdir(CACHE_DIR);
-    for (const file of files) {
-      if (file.endsWith('.jpg')) {
-        const cachePath = path.join(CACHE_DIR, file);
-        if (fs.existsSync(cachePath)) {
-          fs.unlinkSync(cachePath);
-          deletedCount++;
-        }
+    const files = await listCacheFilesRecursive();
+    // Wipe the shard subdirectories themselves (not just their contents) and
+    // recreate them empty, rather than unlinking one file at a time - a
+    // recursive rm is a single syscall-cheap operation regardless of how
+    // many files are inside, unlike iterating potentially millions of them.
+    const entries = await fs.promises.readdir(CACHE_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        await fs.promises.rm(path.join(CACHE_DIR, entry.name), { recursive: true, force: true });
       }
     }
+    ensureShardDirsExist();
     validCacheEntries.clear();
-    console.log(`[cleanup] Finished full wipe. Deleted ${deletedCount} files.`);
+    console.log(`[cleanup] Finished full wipe. Deleted ${files.length} files.`);
   } catch (err) {
     console.error('[cleanup] Error during full wipe:', err);
   }
@@ -587,6 +632,245 @@ router.get('/cleanup-cache', async (ctx) => {
 
 app.use(router.routes()).use(router.allowedMethods());
 
+// --- Cache warmer -----------------------------------------------------
+// Proactively pre-downloads thumbnails for photos in the current warm-cache
+// stage's bbox during idle periods, so common requests are already warm by
+// the time a real user pans there. Ticks at most once per
+// WARM_CACHE_INTERVAL_MS and only when there's no active user-driven
+// prefetch demand - real traffic always wins, this never competes with it.
+// At the default 1s interval that's up to 3600 thumbs/hour while completely
+// idle, negligible load on Wikimedia.
+//
+// Iterates by page_id ascending (not random) - coordinates are scattered
+// across the bbox regardless of page_id order, so a sequential cursor
+// already gives effectively random geographic coverage without the cost of
+// `ORDER BY random()` on every tick.
+//
+// Staged escalation: starts with the (small, high-priority) SVK bbox; once
+// a full lap of it is done (cursor reaches the end and wraps), it advances
+// to the larger V4 bbox (SK+CZ+PL+HU) and continues from page_id 0 there.
+// The V4 stage excludes the SVK bbox entirely (spatial NOT, not just a
+// post-hoc skip) - SVK was already fully warmed in the previous stage, so
+// there's no point even fetching those page_ids again. Add more stages to
+// WARM_CACHE_STAGES for further escalation later (e.g. all of Europe) -
+// each stage can exclude any bbox already covered by an earlier stage.
+//
+// State (stage index, cursor, lap count) persists to disk so a service
+// restart resumes instead of starting over.
+const WARM_CACHE_ENABLED = process.env.WARM_CACHE_ENABLED !== 'false';
+const WARM_CACHE_INTERVAL_MS = process.env.WARM_CACHE_INTERVAL_MS
+  ? parseInt(process.env.WARM_CACHE_INTERVAL_MS, 10)
+  : 1000;
+const WARM_CACHE_BATCH_SIZE = 50;
+const WARM_CACHE_STATE_FILE = path.join(__dirname, '../warm_cache.checkpoint');
+
+interface WarmCacheStage {
+  name: string;
+  bboxEnv: string;
+  defaultBbox: number[];
+  // Optional bbox to EXCLUDE from this stage's query (e.g. a smaller region
+  // already fully warmed by an earlier stage, so it's not re-fetched).
+  excludeBboxEnv?: string;
+  excludeDefaultBbox?: number[];
+  // How many full laps of this stage's bbox before advancing to the next
+  // stage. The last stage should use Infinity (never advances further).
+  lapsBeforeAdvance: number;
+}
+
+const SVK_DEFAULT_BBOX = [16.83, 47.73, 22.57, 49.61];
+const V4_DEFAULT_BBOX = [12.0, 45.7, 24.2, 55.0];
+// Rough Europe bbox (Iceland/Portugal to the Urals, Mediterranean to
+// Scandinavia) - doesn't need to be precise, this is just a warming order,
+// not a hard filter on what's ever servable.
+const EU_DEFAULT_BBOX = [-25, 34, 45, 71];
+
+const WARM_CACHE_STAGES: WarmCacheStage[] = [
+  { name: 'svk', bboxEnv: 'BBOX_SVK', defaultBbox: SVK_DEFAULT_BBOX, lapsBeforeAdvance: 1 },
+  {
+    name: 'v4',
+    bboxEnv: 'BBOX_V4',
+    defaultBbox: V4_DEFAULT_BBOX,
+    excludeBboxEnv: 'BBOX_SVK',
+    excludeDefaultBbox: SVK_DEFAULT_BBOX,
+    // Next month, once V4 is (near-)fully warm from continued idle running,
+    // one more lap here should complete fast - most candidates will already
+    // be cached and get skipped in the same tick (see warmCacheTick).
+    lapsBeforeAdvance: 1,
+  },
+  {
+    name: 'eu',
+    bboxEnv: 'BBOX_EU',
+    defaultBbox: EU_DEFAULT_BBOX,
+    excludeBboxEnv: 'BBOX_V4',
+    excludeDefaultBbox: V4_DEFAULT_BBOX,
+    lapsBeforeAdvance: Infinity,
+  },
+];
+
+function resolveBbox(envName: string, fallback: number[]): number[] {
+  const envVal = process.env[envName];
+  return envVal ? envVal.split(',').map(Number) : fallback;
+}
+
+function getStageBbox(stage: WarmCacheStage): number[] {
+  return resolveBbox(stage.bboxEnv, stage.defaultBbox);
+}
+
+interface WarmCacheState { stageIndex: number; cursor: number; laps: number; }
+
+let warmCacheState: WarmCacheState = { stageIndex: 0, cursor: 0, laps: 0 };
+try {
+  if (fs.existsSync(WARM_CACHE_STATE_FILE)) {
+    const raw = fs.readFileSync(WARM_CACHE_STATE_FILE, 'utf8').trim();
+    // Backward-compat: older checkpoint files just contained a bare page_id.
+    warmCacheState = /^\d+$/.test(raw)
+      ? { stageIndex: 0, cursor: parseInt(raw, 10), laps: 0 }
+      : { ...warmCacheState, ...JSON.parse(raw) };
+  }
+} catch (e) {}
+
+let warmCacheBatch: number[] = [];
+let warmCacheDownloadedCount = 0;
+let warmCacheSkippedCount = 0;
+let warmCacheDownloadedSinceLastSummary = 0;
+
+async function fetchWarmCacheBatch(stage: WarmCacheStage, afterPageId: number): Promise<number[]> {
+  const bbox = getStageBbox(stage);
+  const params: number[] = [bbox[0]!, bbox[1]!, bbox[2]!, bbox[3]!, afterPageId];
+  let query = `
+    SELECT page_id FROM wikimedia_photo
+    WHERE location && ST_MakeEnvelope($1, $2, $3, $4, 4326)
+      AND page_id > $5
+  `;
+  if (stage.excludeBboxEnv || stage.excludeDefaultBbox) {
+    const exBbox = stage.excludeBboxEnv
+      ? resolveBbox(stage.excludeBboxEnv, stage.excludeDefaultBbox!)
+      : stage.excludeDefaultBbox!;
+    params.push(exBbox[0]!, exBbox[1]!, exBbox[2]!, exBbox[3]!);
+    query += ` AND NOT (location && ST_MakeEnvelope($6, $7, $8, $9, 4326))`;
+  }
+  query += ` ORDER BY page_id ASC LIMIT $${params.length + 1}`;
+  params.push(WARM_CACHE_BATCH_SIZE);
+  const result = await getPool().query(query, params);
+  return result.rows.map(r => r.page_id as number);
+}
+
+function nextStageForAdvance(): WarmCacheStage {
+  const stage = WARM_CACHE_STAGES[warmCacheState.stageIndex]!;
+  // Reached the end of this stage's bbox by page_id - one full lap done.
+  warmCacheState.laps++;
+  writeLog(`[warm-cache] Completed lap ${warmCacheState.laps} of stage '${stage.name}'.`);
+  if (warmCacheState.laps >= stage.lapsBeforeAdvance && warmCacheState.stageIndex < WARM_CACHE_STAGES.length - 1) {
+    warmCacheState.stageIndex++;
+    warmCacheState.laps = 0;
+    const nextStage = WARM_CACHE_STAGES[warmCacheState.stageIndex]!;
+    writeLog(`[warm-cache] Advancing to stage '${nextStage.name}'.`);
+    return nextStage;
+  }
+  return stage;
+}
+
+// Upper bound on how many already-cached candidates a single tick will skip
+// past while looking for one that actually needs downloading. Without this,
+// a mostly/fully-warmed stage (e.g. re-lapping V4 after a month of steady
+// warming) would mean most ticks find nothing to do and effectively stall -
+// this makes the guarantee "one fresh download per tick, unless the entire
+// stage really is fully cached" instead of "one *check* per tick".
+const WARM_CACHE_MAX_ATTEMPTS_PER_TICK = 500;
+
+async function warmCacheTick() {
+  if (!WARM_CACHE_ENABLED) return;
+  // Real user traffic always has priority - never compete with it.
+  if (prefetchQueue.length > 0 || prefetchWorkerRunning) return;
+
+  try {
+    for (let attempt = 0; attempt < WARM_CACHE_MAX_ATTEMPTS_PER_TICK; attempt++) {
+      let stage = WARM_CACHE_STAGES[warmCacheState.stageIndex]!;
+
+      if (warmCacheBatch.length === 0) {
+        warmCacheBatch = await fetchWarmCacheBatch(stage, warmCacheState.cursor);
+        if (warmCacheBatch.length === 0) {
+          stage = nextStageForAdvance();
+          warmCacheState.cursor = 0;
+          warmCacheBatch = await fetchWarmCacheBatch(stage, 0);
+          if (warmCacheBatch.length === 0) return; // no photos in this stage's bbox at all
+        }
+      }
+
+      const pageId = warmCacheBatch.shift()!;
+      warmCacheState.cursor = pageId;
+      const fileName = `${pageId}_120.jpg`;
+      if (validCacheEntries.has(fileName)) {
+        warmCacheSkippedCount++;
+        continue; // already warm - try the next candidate right away, same tick
+      }
+
+      const cachePath = getCachePath(pageId, 120);
+      await downloadSemaphore.acquire();
+      try {
+        await downloadThumbnailToCache(String(pageId), 120, cachePath);
+        warmCacheDownloadedCount++;
+        warmCacheDownloadedSinceLastSummary++;
+      } catch (err: any) {
+        writeErrorLog(`[warm-cache] Failed to download pageId ${pageId}: ${err.message}`);
+      } finally {
+        downloadSemaphore.release();
+      }
+      return; // downloaded (or tried to) one photo - done for this tick
+    }
+    writeLog(`[warm-cache] Skipped ${WARM_CACHE_MAX_ATTEMPTS_PER_TICK} already-cached candidates in one tick without finding new work - stage is nearly/fully warm.`);
+  } catch (err: any) {
+    writeErrorLog(`[warm-cache] Tick error: ${err.message}`);
+  }
+}
+
+if (WARM_CACHE_ENABLED) {
+  setInterval(() => {
+    warmCacheTick().catch(() => {});
+  }, WARM_CACHE_INTERVAL_MS);
+
+  // Persist state periodically (not on every tick) so a restart resumes
+  // close to where it left off without a disk write every second.
+  setInterval(() => {
+    try {
+      fs.writeFileSync(WARM_CACHE_STATE_FILE, JSON.stringify(warmCacheState));
+    } catch (e) {}
+  }, 60 * 1000);
+
+  // Daily digest, independent of the per-tick/per-lap logging above - makes
+  // it easy to eyeball warming throughput over time (e.g. "are we actually
+  // making progress towards a full SVK/V4 pass?") without having to count
+  // individual tick lines.
+  setInterval(async () => {
+    const stage = WARM_CACHE_STAGES[warmCacheState.stageIndex]?.name;
+    const { fileCount, totalSize } = await getCacheDirStats();
+    writeLog(
+      `[warm-cache] Daily summary: pre-warmed ${warmCacheDownloadedSinceLastSummary} thumbnails in the last 24h ` +
+      `(current stage: '${stage}', lap ${warmCacheState.laps}, total pre-warmed since startup: ${warmCacheDownloadedCount}). ` +
+      `Cache now holds ${fileCount} files (${formatBytes(totalSize)}).`
+    );
+    warmCacheDownloadedSinceLastSummary = 0;
+  }, 24 * 60 * 60 * 1000);
+}
+
+// Called by importDump.ts once a fresh monthly dump has finished importing -
+// a new dump may contain newly-added Slovak photos, so warming should start
+// over from the small, high-priority SVK bbox instead of continuing wherever
+// it happened to be (e.g. deep into the V4 stage). Localhost-only, same
+// pattern as /cleanup-cache.
+router.get('/warm-cache-reset', (ctx) => {
+  const ip = ctx.request.ip;
+  if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+    ctx.status = 403;
+    ctx.body = 'Forbidden';
+    return;
+  }
+  warmCacheState = { stageIndex: 0, cursor: 0, laps: 0 };
+  warmCacheBatch = [];
+  writeLog('[warm-cache] State reset to stage 0 (svk) via /warm-cache-reset.');
+  ctx.body = { status: 'ok', warmCacheState };
+});
+
 const PORT = process.env.PORT || 4000;
 
 setInterval(() => {
@@ -600,17 +884,42 @@ setInterval(() => {
 
 async function start() {
   await initDb();
-  
+  ensureShardDirsExist();
+
   try {
-    const files = await fs.promises.readdir(CACHE_DIR);
-    for (const file of files) {
-      if (file.endsWith('.jpg')) validCacheEntries.add(file);
+    const files = await listCacheFilesRecursive();
+    for (const relPath of files) {
+      validCacheEntries.add(path.basename(relPath));
     }
     console.log(`Loaded ${validCacheEntries.size} cache entries into RAM.`);
   } catch (err) {
     console.error('Failed to load cache entries to RAM:', err);
   }
 
+  const tokenStr = WIKIMEDIA_ACCESS_TOKEN ? `${WIKIMEDIA_ACCESS_TOKEN.substring(0, 15)}...` : 'NONE';
+  const startupMsg = `[${new Date().toISOString()}] [STARTUP] WikiMediaCache started.\n` +
+                     `[STARTUP] User-Agent: ${BOT_UA}\n` +
+                     `[STARTUP] Concurrency: ${concurrency}\n` +
+                     `[STARTUP] Token (first 15 chars): ${tokenStr}`;
+  writeLog(startupMsg);
+
   app.listen(PORT as number, '0.0.0.0', () => console.log(`WikiMediaCache service running on port ${PORT}`));
 }
+
+// Without these, an error thrown outside a request handler's own try/catch
+// (e.g. in a stray promise, a timer callback) crashes the process silently -
+// systemd/pm2 would just see it exit and restart it, with no record of why.
+// Still exits after logging (Node's own advice: an uncaught exception leaves
+// the process in an undefined state, so resuming instead of restarting is
+// riskier than the crash itself).
+process.on('uncaughtException', (err) => {
+  writeErrorLog(`[FATAL] Uncaught exception: ${err.stack || err.message}`);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
+  writeErrorLog(`[FATAL] Unhandled rejection: ${msg}`);
+  process.exit(1);
+});
+
 start();

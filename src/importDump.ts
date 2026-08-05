@@ -12,8 +12,56 @@ import { pipeline } from 'stream/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getPool, initDb } from './database.js';
+import { CACHE_DIR, ensureShardDirsExist, listCacheFilesRecursive } from './cachePaths.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const LOG_DIR = path.join(__dirname, '../logs');
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+const IMPORT_LOG_FILE = path.join(LOG_DIR, 'import.log');
+
+function logImport(level: 'INFO' | 'WARN' | 'ERROR', msg: string) {
+  const line = `${new Date().toISOString()} [${level}] ${msg}`;
+  if (level === 'ERROR') console.error(line);
+  else console.log(line);
+  try { fs.appendFileSync(IMPORT_LOG_FILE, line + '\n'); } catch (e) {}
+}
+
+async function resetWarmCache() {
+  // A fresh dump may contain newly-added Slovak photos, so the idle cache
+  // warmer should re-scan the SVK bbox from the start instead of continuing
+  // wherever it happened to be (possibly already deep into the larger V4
+  // stage) - see the /warm-cache-reset handler in index.ts. Best-effort:
+  // the server may not be running (e.g. import triggered manually before
+  // first start), in which case this is a harmless no-op.
+  const port = process.env.PORT || 4000;
+  try {
+    await got.get(`http://localhost:${port}/warm-cache-reset`, { timeout: { request: 5000 } });
+    logImport('INFO', 'Warm cache reset to the SVK stage (fresh dump may include new Slovak photos).');
+  } catch (err: any) {
+    logImport('WARN', `Could not reset warm cache (is the server running?): ${err.message}`);
+  }
+}
+
+async function logImportSummary(pool: ReturnType<typeof getPool>) {
+  try {
+    const totalRes = await pool.query('SELECT COUNT(*)::bigint AS count FROM wikimedia_photo');
+    const totalCount = totalRes.rows[0]?.count ?? '0';
+
+    const bbox = process.env.BBOX_SVK
+      ? process.env.BBOX_SVK.split(',').map(Number)
+      : [16.83, 47.73, 22.57, 49.61];
+    const svkRes = await pool.query(
+      'SELECT COUNT(*)::bigint AS count FROM wikimedia_photo WHERE location && ST_MakeEnvelope($1, $2, $3, $4, 4326)',
+      bbox
+    );
+    const svkCount = svkRes.rows[0]?.count ?? '0';
+
+    logImport('INFO', `Database now holds ${totalCount} photos total, of which ${svkCount} are in Slovakia (BBOX_SVK).`);
+  } catch (err: any) {
+    logImport('WARN', `Failed to compute import summary counts: ${err.message}`);
+  }
+}
 
 const DUMP_URL = process.env.DUMP_URL || 'https://dumps.wikimedia.org/commonswiki/latest/commonswiki-latest-geo_tags.sql.gz';
 const BATCH_SIZE = process.env.BATCH_SIZE ? parseInt(process.env.BATCH_SIZE, 10) : 5000;
@@ -26,7 +74,7 @@ async function downloadDump() {
   let startByte = 0;
   if (fs.existsSync(partPath)) {
     startByte = fs.statSync(partPath).size;
-    console.log(`Resuming download from byte ${startByte}...`);
+    logImport('INFO', `Resuming download from byte ${startByte}...`);
   }
 
   const headers: Record<string, string> = {
@@ -43,7 +91,8 @@ async function downloadDump() {
 
   const flags = startByte > 0 ? 'a' : 'w';
   await pipeline(response, fs.createWriteStream(partPath, { flags }));
-  console.log('\nDownload complete.');
+  console.log('');
+  logImport('INFO', 'Dump download complete.');
 
   fs.renameSync(partPath, DUMP_PATH);
 }
@@ -51,13 +100,13 @@ async function downloadDump() {
 async function processDump(pool: ReturnType<typeof getPool>) {
   const isResuming = fs.existsSync(CHECKPOINT_PATH);
   const importStartTime = new Date();
-  
+
   let skipUntilGtId = 0;
   if (isResuming) {
     skipUntilGtId = parseInt(fs.readFileSync(CHECKPOINT_PATH, 'utf8').trim(), 10);
-    console.log(`Resuming from gt_id > ${skipUntilGtId}...`);
+    logImport('INFO', `Resuming from gt_id > ${skipUntilGtId}...`);
   } else {
-    console.log('Processing dump from beginning...');
+    logImport('INFO', 'Processing dump from beginning...');
   }
 
   const gunzip = zlib.createGunzip();
@@ -73,7 +122,7 @@ async function processDump(pool: ReturnType<typeof getPool>) {
 
   const flushBatch = async () => {
     if (batch.length === 0) return;
-    
+
     // Deduplicate by page_id to prevent "ON CONFLICT DO UPDATE command cannot affect row a second time"
     const map = new Map<number, { pageId: number; lat: number; lon: number }>();
     for (const item of batch) {
@@ -100,8 +149,8 @@ async function processDump(pool: ReturnType<typeof getPool>) {
       totalInserted += currentBatch.length;
       fs.writeFileSync(CHECKPOINT_PATH, String(lastGtId));
       process.stdout.write(`\rInserted ${totalInserted} records (gt_id: ${lastGtId})...`);
-    } catch (err) {
-      console.error('Batch insert error:', err);
+    } catch (err: any) {
+      logImport('ERROR', `Batch insert error: ${err.message}`);
       throw err;
     }
   };
@@ -136,39 +185,39 @@ async function processDump(pool: ReturnType<typeof getPool>) {
   if (batch.length > 0) await flushBatch();
 
   if (fs.existsSync(CHECKPOINT_PATH)) fs.unlinkSync(CHECKPOINT_PATH);
-  console.log(`\nImport finished! Total inserted/updated: ${totalInserted}`);
+  console.log('');
+  logImport('INFO', `Import finished! Total inserted/updated: ${totalInserted}`);
 
   if (!isResuming) {
-    console.log('Cleaning up old records (not present in this dump)...');
+    logImport('INFO', 'Cleaning up old records (not present in this dump)...');
     try {
       const deleteRes = await pool.query('DELETE FROM wikimedia_photo WHERE updated_at < $1', [importStartTime]);
-      console.log(`Deleted ${deleteRes.rowCount} obsolete records from database.`);
-    } catch (err) {
-      console.error('Database cleanup error:', err);
+      logImport('INFO', `Deleted ${deleteRes.rowCount} obsolete records from database.`);
+    } catch (err: any) {
+      logImport('ERROR', `Database cleanup error: ${err.message}`);
     }
   } else {
-    console.log('Skipping database cleanup because import was resumed from a checkpoint.');
+    logImport('INFO', 'Skipping database cleanup because import was resumed from a checkpoint.');
   }
 }
 
 async function cleanupDeletedThumbnails(pool: ReturnType<typeof getPool>) {
-  console.log('\nStarting cache cleanup for deleted thumbnails...');
-  const CACHE_DIR = path.join(__dirname, '../cache');
-  if (!fs.existsSync(CACHE_DIR)) return;
+  logImport('INFO', 'Starting cache cleanup for deleted thumbnails...');
 
-  const files = fs.readdirSync(CACHE_DIR).filter(f => f.endsWith('.jpg'));
-  const fileMap = new Map<number, string[]>();
+  const files = await listCacheFilesRecursive(); // relative paths, e.g. "042/1234567_120.jpg"
+  const fileMap = new Map<number, string[]>(); // pageId -> relative paths
 
-  for (const file of files) {
-    const pageId = parseInt(file.split('_')[0]!, 10);
+  for (const relPath of files) {
+    const baseName = path.basename(relPath);
+    const pageId = parseInt(baseName.split('_')[0]!, 10);
     if (!isNaN(pageId)) {
       if (!fileMap.has(pageId)) fileMap.set(pageId, []);
-      fileMap.get(pageId)!.push(file);
+      fileMap.get(pageId)!.push(relPath);
     }
   }
 
   const pageIds = Array.from(fileMap.keys());
-  console.log(`Found ${pageIds.length} unique pageIds in cache.`);
+  logImport('INFO', `Found ${pageIds.length} unique pageIds in cache.`);
 
   let deletedCount = 0;
   const BATCH = 5000;
@@ -180,8 +229,8 @@ async function cleanupDeletedThumbnails(pool: ReturnType<typeof getPool>) {
 
       for (const id of batchIds) {
         if (!existingIds.has(id)) {
-          for (const file of fileMap.get(id)!) {
-            const cachePath = path.join(CACHE_DIR, file);
+          for (const relPath of fileMap.get(id)!) {
+            const cachePath = path.join(CACHE_DIR, relPath);
             if (fs.existsSync(cachePath)) {
               fs.unlinkSync(cachePath);
               deletedCount++;
@@ -190,21 +239,24 @@ async function cleanupDeletedThumbnails(pool: ReturnType<typeof getPool>) {
         }
       }
       process.stdout.write(`\rChecked ${Math.min(i + BATCH, pageIds.length)}/${pageIds.length} cached IDs...`);
-    } catch (err) {
-      console.error('\nError during cleanup batch:', err);
+    } catch (err: any) {
+      logImport('ERROR', `Error during cleanup batch: ${err.message}`);
     }
   }
 
-  console.log(`\nCache cleanup finished! Deleted ${deletedCount} obsolete thumbnails.`);
+  console.log('');
+  logImport('INFO', `Cache cleanup finished! Deleted ${deletedCount} obsolete thumbnails.`);
 }
 
 export async function runImport() {
+  const startedAt = Date.now();
+  logImport('INFO', '=== Import started ===');
   await initDb();
+  ensureShardDirsExist();
   const pool = getPool();
 
   if (fs.existsSync(DUMP_PATH)) {
-    console.log(`Found existing dump at ${DUMP_PATH}, skipping download.`);
-    console.log('Delete it manually to force re-download.');
+    logImport('INFO', `Found existing dump at ${DUMP_PATH}, skipping download. Delete it manually to force re-download.`);
   } else {
     await downloadDump();
   }
@@ -213,12 +265,19 @@ export async function runImport() {
 
   await cleanupDeletedThumbnails(pool);
 
+  await logImportSummary(pool);
+
+  await resetWarmCache();
+
   // Keep the file for potential re-runs; delete only on explicit cleanup
   const sizeMB = (fs.statSync(DUMP_PATH).size / 1024 / 1024).toFixed(0);
-  console.log(`Dump kept at ${DUMP_PATH} (${sizeMB}MB). Delete manually when no longer needed.`);
+  logImport('INFO', `Dump kept at ${DUMP_PATH} (${sizeMB}MB). Delete manually when no longer needed.`);
+
+  const durationMin = ((Date.now() - startedAt) / 60000).toFixed(1);
+  logImport('INFO', `=== Import finished successfully in ${durationMin} min ===`);
 }
 
 runImport().then(() => process.exit(0)).catch(err => {
-  console.error(err);
+  logImport('ERROR', `=== Import FAILED: ${err.message} ===`);
   process.exit(1);
 });
