@@ -55,8 +55,16 @@ if (allowedHashes.size === 0) {
   console.warn('WARNING: No valid API keys found in api_keys.txt. All requests will be rejected with 401 Unauthorized.');
 }
 
+// Lokalne admin endpointy sa neoverujuju API klucom - maju vlastnu, prisnejsiu
+// podmienku (priame spojenie z localhostu, nie cez proxy - viz nizsie). Kluc
+// by tu bol aj tak nepouzitelny: `api_keys.txt` obsahuje len SHA-256
+// odtlacky, nie same kluce, takze volajuci na tom istom stroji (importDump.ts)
+// nema odkial platny kluc vziat - a prave preto vracal /warm-cache-reset 401.
+const LOCAL_ADMIN_PATHS = new Set(['/warm-cache-reset', '/cleanup-cache']);
+
 app.use(async (ctx, next) => {
-  if (ctx.path === '/status' || ctx.path === '/metrics') {
+  if (ctx.path === '/status' || ctx.path === '/metrics' ||
+      LOCAL_ADMIN_PATHS.has(ctx.path)) {
     return next();
   }
   
@@ -675,9 +683,22 @@ async function runFullCleanup() {
   }
 }
 
-router.get('/cleanup-cache', async (ctx) => {
+/// Prisla poziadavka priamo z tohto stroja, mimo proxy?
+///
+/// Samotna kontrola IP nestaci: `app.proxy = true` znamena, ze `ctx.request
+/// .ip` sa berie z `X-Forwarded-For`, co je hlavicka od klienta. Ktokolvek
+/// zvonku by si do nej mohol napisat 127.0.0.1 a lokalne admin endpointy by
+/// mu otvorili. Nginx tu hlavicku pri kazdom proxovani nastavuje, kym
+/// volanie priamo na port ju nema vobec - jej NEPRITOMNOST je teda spolahliva
+/// znamka, ze spojenie neprislo zvonku.
+function isDirectLocalRequest(ctx: Koa.Context): boolean {
+  if (ctx.get('x-forwarded-for')) return false;
   const ip = ctx.request.ip;
-  if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
+router.get('/cleanup-cache', async (ctx) => {
+  if (!isDirectLocalRequest(ctx)) {
     ctx.status = 403;
     ctx.body = 'Forbidden';
     return;
@@ -955,8 +976,7 @@ if (WARM_CACHE_ENABLED) {
 // it happened to be (e.g. deep into the V4 stage). Localhost-only, same
 // pattern as /cleanup-cache.
 router.get('/warm-cache-reset', (ctx) => {
-  const ip = ctx.request.ip;
-  if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+  if (!isDirectLocalRequest(ctx)) {
     ctx.status = 403;
     ctx.body = 'Forbidden';
     return;

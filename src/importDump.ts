@@ -41,20 +41,12 @@ async function resetWarmCache() {
   // the server may not be running (e.g. import triggered manually before
   // first start), in which case this is a harmless no-op.
   const port = process.env.PORT || 4000;
-  // Endpoint je sice localhost-only, ale ide aj cez globalnu autorizaciu
-  // servera - bez kluca vrati 401 (co sa aj dialo, viz WARN v import.log).
-  // Beriem prvy kluc z toho isteho suboru, z akeho ich cita server.
-  let apiKey = '';
+  // Bez API kluca zamerne: endpoint je z globalnej autorizacie vynaty a
+  // chrani sa tym, ze pusti len priame spojenie z localhostu (viz
+  // `isDirectLocalRequest` v index.ts). Kluc by sme sem ani nevedeli dostat -
+  // `api_keys.txt` obsahuje len SHA-256 odtlacky.
   try {
-    apiKey = fs.readFileSync(path.join(__dirname, '../api_keys.txt'), 'utf8')
-      .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))[0] || '';
-  } catch (e) { /* kluc sa neda precitat - skusime to aj tak */ }
-
-  try {
-    await got.get(`http://localhost:${port}/warm-cache-reset`, {
-      timeout: { request: 5000 },
-      headers: apiKey ? { 'X-Freemap-API-Key': apiKey } : {},
-    });
+    await got.get(`http://localhost:${port}/warm-cache-reset`, { timeout: { request: 5000 } });
     logImport('INFO', 'Warm cache reset to the SVK stage (fresh dump may include new Slovak photos).');
   } catch (err: any) {
     logImport('WARN', `Could not reset warm cache (is the server running?): ${err.message}`);
