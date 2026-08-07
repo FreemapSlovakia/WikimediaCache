@@ -41,8 +41,20 @@ async function resetWarmCache() {
   // the server may not be running (e.g. import triggered manually before
   // first start), in which case this is a harmless no-op.
   const port = process.env.PORT || 4000;
+  // Endpoint je sice localhost-only, ale ide aj cez globalnu autorizaciu
+  // servera - bez kluca vrati 401 (co sa aj dialo, viz WARN v import.log).
+  // Beriem prvy kluc z toho isteho suboru, z akeho ich cita server.
+  let apiKey = '';
   try {
-    await got.get(`http://localhost:${port}/warm-cache-reset`, { timeout: { request: 5000 } });
+    apiKey = fs.readFileSync(path.join(__dirname, '../api_keys.txt'), 'utf8')
+      .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'))[0] || '';
+  } catch (e) { /* kluc sa neda precitat - skusime to aj tak */ }
+
+  try {
+    await got.get(`http://localhost:${port}/warm-cache-reset`, {
+      timeout: { request: 5000 },
+      headers: apiKey ? { 'X-Freemap-API-Key': apiKey } : {},
+    });
     logImport('INFO', 'Warm cache reset to the SVK stage (fresh dump may include new Slovak photos).');
   } catch (err: any) {
     logImport('WARN', `Could not reset warm cache (is the server running?): ${err.message}`);
@@ -105,7 +117,25 @@ async function downloadDump() {
 
 async function processDump(pool: ReturnType<typeof getPool>) {
   const isResuming = fs.existsSync(CHECKPOINT_PATH);
-  const importStartTime = new Date();
+
+  // Znacka zaciatku importu MUSI prist z databazy a ako RETAZEC.
+  //
+  // `wikimedia_photo.updated_at` je `TIMESTAMP` (bez casovej zony) a plni sa
+  // cez `CURRENT_TIMESTAMP`, teda hodinami databazy. Ked sa sem dosadil
+  // `new Date()` z Node-u, driver ho poslal s offsetom lokalnej zony
+  // procesu - a Postgres pri porovnani s `timestamp without time zone`
+  // offset ZAHODI a zoberie len cislice. Pri Node v CEST a databaze v UTC
+  // tak bola znacka o dve hodiny "v buducnosti" oproti prave zapisanym
+  // riadkom a nasledny `DELETE ... WHERE updated_at < $1` zmazal CELU
+  // tabulku vratane toho, co import prave vlozil (7.8.2026: 37,061,315
+  // riadkov, databaza ostala prazdna).
+  //
+  // Retazec ziadnu konverziu zon neprejde - to, co Postgres vrati, to aj
+  // dostane spat.
+  const { rows: startRows } = await pool.query(
+    'SELECT CURRENT_TIMESTAMP::timestamp::text AS t',
+  );
+  const importStartTime: string = startRows[0].t;
 
   let skipUntilGtId = 0;
   if (isResuming) {
@@ -197,8 +227,31 @@ async function processDump(pool: ReturnType<typeof getPool>) {
   if (!isResuming) {
     logImport('INFO', 'Cleaning up old records (not present in this dump)...');
     try {
-      const deleteRes = await pool.query('DELETE FROM wikimedia_photo WHERE updated_at < $1', [importStartTime]);
-      logImport('INFO', `Deleted ${deleteRes.rowCount} obsolete records from database.`);
+      // Najprv len SPOCITAT. Cistenie ma odstranit hrstku zaznamov, ktore uz
+      // v novom dumpe nie su - ked ich vyjde porovnatelne vela ako toho, co
+      // sme prave vlozili, nieco je zle a mazat sa NESMIE. Tato poistka je
+      // tu preto, ze presne to sa raz stalo (viz importStartTime vyssie) a
+      // databaza ostala prazdna.
+      const { rows } = await pool.query(
+        'SELECT COUNT(*)::int AS c FROM wikimedia_photo WHERE updated_at < $1::timestamp',
+        [importStartTime],
+      );
+      const stale = rows[0].c as number;
+      const limit = Math.floor(totalInserted * 0.5);
+
+      if (stale > limit) {
+        logImport(
+          'ERROR',
+          `Cleanup ABORTED: would delete ${stale} records, which is more than half of the ${totalInserted} just imported. ` +
+            'That points to a bug, not to obsolete data - database left untouched.',
+        );
+      } else {
+        const deleteRes = await pool.query(
+          'DELETE FROM wikimedia_photo WHERE updated_at < $1::timestamp',
+          [importStartTime],
+        );
+        logImport('INFO', `Deleted ${deleteRes.rowCount} obsolete records from database.`);
+      }
     } catch (err: any) {
       logImport('ERROR', `Database cleanup error: ${err.message}`);
     }
@@ -209,6 +262,20 @@ async function processDump(pool: ReturnType<typeof getPool>) {
 
 async function cleanupDeletedThumbnails(pool: ReturnType<typeof getPool>) {
   logImport('INFO', 'Starting cache cleanup for deleted thumbnails...');
+
+  // Prazdna tabulka znamena, ze kazdy nahlad vyzera ako "uz neexistujuca
+  // fotka" - a cistenie by zmazalo CELU cache. Presne to sa 7.8.2026 stalo
+  // (129,170 nahladov) po tom, co import omylom vyprazdnil databazu.
+  // Prazdna tabulka nie je stav, v ktorom sa da o cache rozhodovat.
+  const { rows: guard } = await pool.query('SELECT COUNT(*)::int AS c FROM wikimedia_photo');
+  if (guard[0].c === 0) {
+    logImport(
+      'ERROR',
+      'Cache cleanup SKIPPED: photo table is empty, so every thumbnail would look obsolete. ' +
+        'Fix the import first, then re-run.',
+    );
+    return;
+  }
 
   const files = await listCacheFilesRecursive(); // relative paths, e.g. "042/1234567_120.jpg"
   const fileMap = new Map<number, string[]>(); // pageId -> relative paths
