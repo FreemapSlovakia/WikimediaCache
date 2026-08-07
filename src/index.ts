@@ -117,16 +117,67 @@ const prefetchQueued = new Set<string>(); // Set of pageIds currently in queue
 let prefetchWorkerRunning = false;
 let successfulDownloadsSinceLastBlock = 0;
 
-const LOG_FILE = process.env.LOG_FILE || path.join(__dirname, '../wikimedia_errors.log');
+// LOG_FILE sa VZDY rozvinie na absolutnu cestu ukotvenu v adresari appky.
+//
+// Predtym sa relativna hodnota brala tak, ako prisla - a `.env.example` ju
+// taku aj ponuka (LOG_FILE="wikimedia_errors.log"). `fs.appendFileSync` ju
+// potom riesil voci `process.cwd()`, co pod systemd bez `WorkingDirectory=`
+// je "/" - zapis teda skoncil na EACCES a do suboru sa nedostalo nic.
+// Default smeruje do `logs/`, rovnako ako import (`importDump.ts`), aby boli
+// vsetky logy na jednom mieste.
+const LOG_FILE = path.resolve(
+  __dirname,
+  '..',
+  process.env.LOG_FILE || 'logs/wikimedia_errors.log',
+);
+fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+
+// Statistiky maju vlastny subor. Do error logu nepatria - miluje sa ich
+// hladat prave preto, ze ich tam prekryvala prevadzkova omacka. Su to
+// milniky, ktore chce clovek vidiet na jednom mieste a v case:
+// dokoncene okruhy prehrievania cache, prechody medzi stagemi, denny suhrn
+// a startovaci banner (ten dava zvysnym cislam kontext).
+const STAT_LOG_FILE = path.resolve(
+  __dirname,
+  '..',
+  process.env.STAT_LOG_FILE || 'logs/stat.log',
+);
+fs.mkdirSync(path.dirname(STAT_LOG_FILE), { recursive: true });
+
+// Zlyhany zapis do logu sa uz NEPREHLTNE potichu. Prave to bolo na povodnej
+// verzii najhorsie: `catch (e) {}` znamenalo, ze nefunkcne logovanie
+// vyzeralo presne ako "nic sa nedeje". Hlasi sa raz, nech to nezaplavi
+// journal pri trvalom probleme s pravami.
+let logWriteFailureReported = false;
+
+function appendToLogFile(msg: string, file: string = LOG_FILE) {
+  try {
+    fs.appendFileSync(file, msg + '\n');
+  } catch (e) {
+    if (!logWriteFailureReported) {
+      logWriteFailureReported = true;
+      console.error(
+        `[log] Nepodarilo sa zapisat do ${file}: ${e}. ` +
+        `Dalsie zlyhania zapisu uz nehlasim.`,
+      );
+    }
+  }
+}
 
 function writeLog(msg: string) {
   console.log(msg);
-  try { fs.appendFileSync(LOG_FILE, msg + '\n'); } catch (e) {}
+  appendToLogFile(msg);
 }
 
 function writeErrorLog(msg: string) {
   console.error(msg);
-  try { fs.appendFileSync(LOG_FILE, msg + '\n'); } catch (e) {}
+  appendToLogFile(msg);
+}
+
+/// Milnik alebo suhrn - ide do `stat.log`, nie medzi chyby.
+function writeStatLog(msg: string) {
+  console.log(msg);
+  appendToLogFile(msg, STAT_LOG_FILE);
 }
 
 function logWikimediaError(context: string, err: any) {
@@ -759,12 +810,12 @@ function nextStageForAdvance(): WarmCacheStage {
   const stage = WARM_CACHE_STAGES[warmCacheState.stageIndex]!;
   // Reached the end of this stage's bbox by page_id - one full lap done.
   warmCacheState.laps++;
-  writeLog(`[warm-cache] Completed lap ${warmCacheState.laps} of stage '${stage.name}'.`);
+  writeStatLog(`[warm-cache] Completed lap ${warmCacheState.laps} of stage '${stage.name}'.`);
   if (warmCacheState.laps >= stage.lapsBeforeAdvance && warmCacheState.stageIndex < WARM_CACHE_STAGES.length - 1) {
     warmCacheState.stageIndex++;
     warmCacheState.laps = 0;
     const nextStage = WARM_CACHE_STAGES[warmCacheState.stageIndex]!;
-    writeLog(`[warm-cache] Advancing to stage '${nextStage.name}'.`);
+    writeStatLog(`[warm-cache] Advancing to stage '${nextStage.name}'.`);
     return nextStage;
   }
   return stage;
@@ -818,7 +869,7 @@ async function warmCacheTick() {
       }
       return; // downloaded (or tried to) one photo - done for this tick
     }
-    writeLog(`[warm-cache] Skipped ${WARM_CACHE_MAX_ATTEMPTS_PER_TICK} already-cached candidates in one tick without finding new work - stage is nearly/fully warm.`);
+    writeStatLog(`[warm-cache] Skipped ${WARM_CACHE_MAX_ATTEMPTS_PER_TICK} already-cached candidates in one tick without finding new work - stage is nearly/fully warm.`);
   } catch (err: any) {
     writeErrorLog(`[warm-cache] Tick error: ${err.message}`);
   }
@@ -844,7 +895,7 @@ if (WARM_CACHE_ENABLED) {
   setInterval(async () => {
     const stage = WARM_CACHE_STAGES[warmCacheState.stageIndex]?.name;
     const { fileCount, totalSize } = await getCacheDirStats();
-    writeLog(
+    writeStatLog(
       `[warm-cache] Daily summary: pre-warmed ${warmCacheDownloadedSinceLastSummary} thumbnails in the last 24h ` +
       `(current stage: '${stage}', lap ${warmCacheState.laps}, total pre-warmed since startup: ${warmCacheDownloadedCount}). ` +
       `Cache now holds ${fileCount} files (${formatBytes(totalSize)}).`
@@ -867,7 +918,7 @@ router.get('/warm-cache-reset', (ctx) => {
   }
   warmCacheState = { stageIndex: 0, cursor: 0, laps: 0 };
   warmCacheBatch = [];
-  writeLog('[warm-cache] State reset to stage 0 (svk) via /warm-cache-reset.');
+  writeStatLog('[warm-cache] State reset to stage 0 (svk) via /warm-cache-reset.');
   ctx.body = { status: 'ok', warmCacheState };
 });
 
@@ -901,7 +952,7 @@ async function start() {
                      `[STARTUP] User-Agent: ${BOT_UA}\n` +
                      `[STARTUP] Concurrency: ${concurrency}\n` +
                      `[STARTUP] Token (first 15 chars): ${tokenStr}`;
-  writeLog(startupMsg);
+  writeStatLog(startupMsg);
 
   app.listen(PORT as number, '0.0.0.0', () => console.log(`WikiMediaCache service running on port ${PORT}`));
 }

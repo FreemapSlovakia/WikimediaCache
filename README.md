@@ -115,7 +115,7 @@ BBOX_EU="-25,34,45,71"
 
 At the default interval that's up to 3600 thumbnails/hour while fully idle - negligible load on Wikimedia. Progress is visible in `/status` (`warmCacheDownloadedCount`, `warmCacheSkippedCount`, `warmCacheStage`, `warmCacheLaps`, `warmCacheCursor`) and `/metrics`.
 
-Logged to the server's log file (`LOG_FILE`, default `wikimedia_errors.log`, not `logs/import.log` - that one is import-only, see above):
+Logged to the **stats log** (`STAT_LOG_FILE`, default `logs/stat.log`) - deliberately separate from the error log, since these are milestones rather than failures. Both paths resolve relative to the app directory, not the working directory. (Not to be confused with `logs/import.log` - that one is import-only, see above.)
 - Every time a stage's bbox completes a full lap (`Completed lap N of stage 'svk'.`) and whenever it advances to the next stage (`Advancing to stage 'v4'.`) - so you can tell exactly when SVK (and later V4) has been fully pre-warmed.
 - A daily digest (`Daily summary: pre-warmed N thumbnails in the last 24h ...`) so warming throughput is easy to eyeball over time without counting individual lines.
 
