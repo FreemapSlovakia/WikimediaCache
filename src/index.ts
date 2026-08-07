@@ -144,6 +144,35 @@ const STAT_LOG_FILE = path.resolve(
 );
 fs.mkdirSync(path.dirname(STAT_LOG_FILE), { recursive: true });
 
+// Znacka o poslednom USPESNOM importe - zapisuje ju `importDump.ts` az na
+// konci svojho behu, takze cesta musi sediet s LAST_IMPORT_FILE tam.
+// Cita sa pri kazdom pouziti, nie raz pri starte: import bezi ako
+// samostatny proces (mesacny cron), takze subor sa meni "pod rukami".
+const LAST_IMPORT_FILE = path.resolve(__dirname, '../logs/last_import.json');
+
+function describeLastImport(): string {
+  try {
+    const raw = JSON.parse(fs.readFileSync(LAST_IMPORT_FILE, 'utf8'));
+    const finishedAt = new Date(raw.finishedAt);
+    if (isNaN(finishedAt.getTime())) {
+      return `[import] Last successful import: unreadable timestamp in ${LAST_IMPORT_FILE}.`;
+    }
+    const ageDays = (Date.now() - finishedAt.getTime()) / 86400000;
+    const age =
+      ageDays < 1
+        ? `${Math.round(ageDays * 24)}h ago`
+        : `${ageDays.toFixed(1)} days ago`;
+    const took = raw.durationMin ? `, took ${raw.durationMin} min` : '';
+    return `[import] Last successful import: ${raw.finishedAt} (${age}${took}).`;
+  } catch (e: any) {
+    // ENOENT je uplne bezny stav (dump sa este ani raz neimportoval), preto
+    // to nie je chyba - len sa to takto povie.
+    return e?.code === 'ENOENT'
+      ? '[import] No successful import recorded yet.'
+      : `[import] Could not read ${LAST_IMPORT_FILE}: ${e?.message}`;
+  }
+}
+
 // Zlyhany zapis do logu sa uz NEPREHLTNE potichu. Prave to bolo na povodnej
 // verzii najhorsie: `catch (e) {}` znamenalo, ze nefunkcne logovanie
 // vyzeralo presne ako "nic sa nedeje". Hlasi sa raz, nech to nezaplavi
@@ -359,6 +388,15 @@ function formatBytes(bytes: number): string {
     unitIndex++;
   }
   return `${value.toFixed(1)}${units[unitIndex]}`;
+}
+
+/// Perioda suhrnu v citatelnej podobe ("1h", "30m", "24h") - aby riadok v
+/// stat.log povedal, za aky usek to cislo plati, aj ked sa perioda zmeni.
+function formatDuration(ms: number): string {
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
 const activeClients = new Map<string, number>();
@@ -713,6 +751,12 @@ const WARM_CACHE_INTERVAL_MS = process.env.WARM_CACHE_INTERVAL_MS
   ? parseInt(process.env.WARM_CACHE_INTERVAL_MS, 10)
   : 1000;
 const WARM_CACHE_BATCH_SIZE = 50;
+// Ako casto sa do `stat.log` zapisuje suhrn prehrievania. Bolo to napevno
+// 24h, co je na sledovanie priebehu prilis riedke - hodina dava rozumnu
+// krivku a subor tym nenarastie (24 riadkov za den).
+const STAT_SUMMARY_INTERVAL_MS = process.env.STAT_SUMMARY_INTERVAL_MS
+  ? parseInt(process.env.STAT_SUMMARY_INTERVAL_MS, 10)
+  : 60 * 60 * 1000;
 const WARM_CACHE_STATE_FILE = path.join(__dirname, '../warm_cache.checkpoint');
 
 interface WarmCacheStage {
@@ -888,20 +932,21 @@ if (WARM_CACHE_ENABLED) {
     } catch (e) {}
   }, 60 * 1000);
 
-  // Daily digest, independent of the per-tick/per-lap logging above - makes
-  // it easy to eyeball warming throughput over time (e.g. "are we actually
-  // making progress towards a full SVK/V4 pass?") without having to count
-  // individual tick lines.
+  // Periodicky suhrn, nezavisly od per-tick/per-lap logovania vyssie - z neho
+  // sa da na jeden pohlad povedat, ci prehrievanie realne postupuje
+  // ("blizime sa vobec k plnemu SVK/V4 prechodu?") bez ratania jednotlivych
+  // riadkov. Perioda je STAT_SUMMARY_INTERVAL_MS (default 1h).
+  const summaryPeriodLabel = formatDuration(STAT_SUMMARY_INTERVAL_MS);
   setInterval(async () => {
     const stage = WARM_CACHE_STAGES[warmCacheState.stageIndex]?.name;
     const { fileCount, totalSize } = await getCacheDirStats();
     writeStatLog(
-      `[warm-cache] Daily summary: pre-warmed ${warmCacheDownloadedSinceLastSummary} thumbnails in the last 24h ` +
+      `[warm-cache] Summary: pre-warmed ${warmCacheDownloadedSinceLastSummary} thumbnails in the last ${summaryPeriodLabel} ` +
       `(current stage: '${stage}', lap ${warmCacheState.laps}, total pre-warmed since startup: ${warmCacheDownloadedCount}). ` +
       `Cache now holds ${fileCount} files (${formatBytes(totalSize)}).`
     );
     warmCacheDownloadedSinceLastSummary = 0;
-  }, 24 * 60 * 60 * 1000);
+  }, STAT_SUMMARY_INTERVAL_MS);
 }
 
 // Called by importDump.ts once a fresh monthly dump has finished importing -
@@ -953,6 +998,10 @@ async function start() {
                      `[STARTUP] Concurrency: ${concurrency}\n` +
                      `[STARTUP] Token (first 15 chars): ${tokenStr}`;
   writeStatLog(startupMsg);
+  // Hned po starte a potom raz denne - aby bolo v `stat.log` vidiet, ci
+  // mesacny import dump vobec presiel, bez nutnosti hrabat sa v import.log.
+  writeStatLog(describeLastImport());
+  setInterval(() => writeStatLog(describeLastImport()), 24 * 60 * 60 * 1000);
 
   app.listen(PORT as number, '0.0.0.0', () => console.log(`WikiMediaCache service running on port ${PORT}`));
 }

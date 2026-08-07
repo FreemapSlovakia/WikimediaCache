@@ -117,7 +117,7 @@ At the default interval that's up to 3600 thumbnails/hour while fully idle - neg
 
 Logged to the **stats log** (`STAT_LOG_FILE`, default `logs/stat.log`) - deliberately separate from the error log, since these are milestones rather than failures. Both paths resolve relative to the app directory, not the working directory. (Not to be confused with `logs/import.log` - that one is import-only, see above.)
 - Every time a stage's bbox completes a full lap (`Completed lap N of stage 'svk'.`) and whenever it advances to the next stage (`Advancing to stage 'v4'.`) - so you can tell exactly when SVK (and later V4) has been fully pre-warmed.
-- A daily digest (`Daily summary: pre-warmed N thumbnails in the last 24h ...`) so warming throughput is easy to eyeball over time without counting individual lines.
+- A periodic digest (`Summary: pre-warmed N thumbnails in the last 1h ...`) so warming throughput is easy to eyeball over time without counting individual lines. The period is `STAT_SUMMARY_INTERVAL_MS` (default 1 hour); the line always states the period it covers, so it stays readable if you change it.
 
 Once V4 finishes a full lap too, adding an even wider stage (e.g. all of Europe) is a one-line addition to `WARM_CACHE_STAGES` - no other changes needed.
 

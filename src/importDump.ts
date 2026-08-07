@@ -19,6 +19,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = path.join(__dirname, '../logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 const IMPORT_LOG_FILE = path.join(LOG_DIR, 'import.log');
+// Znacka o poslednom USPESNOM importe. Zapisuje sa az uplne na konci
+// `runImport()`, takze prerusenny alebo padnuty beh ju nechá na predoslej
+// hodnote - presne o to ide, ked sa niekto pyta "kedy naposledy presiel".
+// Cita ju server (`index.ts`), aby to raz denne pripomenul v `stat.log`;
+// cesta preto musi sediet s LAST_IMPORT_FILE tam.
+const LAST_IMPORT_FILE = path.join(LOG_DIR, 'last_import.json');
 
 function logImport(level: 'INFO' | 'WARN' | 'ERROR', msg: string) {
   const line = `${new Date().toISOString()} [${level}] ${msg}`;
@@ -275,6 +281,22 @@ export async function runImport() {
 
   const durationMin = ((Date.now() - startedAt) / 60000).toFixed(1);
   logImport('INFO', `=== Import finished successfully in ${durationMin} min ===`);
+
+  try {
+    fs.writeFileSync(
+      LAST_IMPORT_FILE,
+      JSON.stringify(
+        {
+          finishedAt: new Date().toISOString(),
+          durationMin: Number(durationMin),
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+  } catch (err: any) {
+    logImport('WARN', `Could not write ${LAST_IMPORT_FILE}: ${err.message}`);
+  }
 }
 
 runImport().then(() => process.exit(0)).catch(err => {
