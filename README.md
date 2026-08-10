@@ -95,11 +95,15 @@ Returns `202 Accepted` immediately. The cleanup task runs asynchronously in the 
 
 While the service is idle (no active user-driven prefetch demand), a background job downloads **one fresh thumbnail per tick** (default: every `WARM_CACHE_INTERVAL_MS` = 1000ms), so the cache is already warm by the time a real user pans there. Real traffic always takes priority - the warmer pauses immediately whenever the prefetch queue is non-empty.
 
-Within a tick, already-cached candidates are skipped immediately (no waiting) until one that actually needs downloading is found - the 1-second pacing only applies *between* actual downloads, not between checks. So once a region is fully warm and only the odd new photo trickles in, it still ends up cached almost immediately instead of being throttled to "maybe once every N seconds" by how many already-cached IDs happen to precede it.
+Within a tick, already-cached candidates are skipped immediately (no waiting) until one that actually needs downloading is found - the pacing (both the tick interval and the per-stage gap below) only applies *between* actual downloads, not between checks. So once a region is fully warm and only the odd new photo trickles in, it still ends up cached almost immediately instead of being throttled to "maybe once every N seconds" by how many already-cached IDs happen to precede it.
 
 It walks the dataset by `page_id` ascending (not random) within the current stage's bbox - coordinates are scattered geographically regardless of `page_id` order, so this already gives effectively random coverage without the cost of `ORDER BY random()` on every tick.
 
 **Staged escalation**: warming starts with the small, high-priority `BBOX_SVK` bbox, then `BBOX_V4` (Slovakia + Czechia + Poland + Hungary), then `BBOX_EU` (all of Europe) - each stage advances to the next once it completes a full lap (cursor reaches the end and wraps around). Each stage after the first spatially excludes the bbox(es) already covered by earlier stages (`AND NOT (location && ...)`) so that region is never even fetched again, not just skipped. `BBOX_EU` is the final stage (never advances further) - add more entries to `WARM_CACHE_STAGES` in `src/index.ts` if an even wider scope is ever needed.
+
+**Per-stage pacing**: each stage also carries a `downloadGapMs` - a minimum spacing between two *actual* downloads, on top of the tick interval. SVK uses `0` (the tick interval alone governs, i.e. one per second), while V4 and EU use `2000`. The reasoning is that SVK is small and high-priority, so it should finish fast, whereas the wider stages are far larger and much less urgent - a local user only ever sees a fraction of them - so there's no reason to sustain a high request rate against Wikimedia for them. Slowing them down keeps rate-limit headroom for the unplanned, user-driven requests that arrive from anywhere in Europe. Override per stage with `WARM_CACHE_GAP_MS_<STAGE>`, e.g. `WARM_CACHE_GAP_MS_V4=3000`.
+
+The gap is measured from the *completion* of the previous download and applies to every attempt that actually reached Wikimedia, failures included - a failed request counts against their rate limit just the same. Skipping already-cached candidates is never delayed. Because ticks fire on a fixed grid, the gate rounds to the nearest tick rather than always up: without that, `downloadGapMs=2000` on a 1s tick would in practice mean a 3-second spacing (1200/h instead of 1800/h), i.e. the configured number would not mean what it says.
 
 State (current stage, cursor, lap count) is persisted to `warm_cache.checkpoint` every 60s so a restart resumes instead of starting over.
 
@@ -109,11 +113,15 @@ Configure via `.env`:
 ```env
 WARM_CACHE_ENABLED=true
 WARM_CACHE_INTERVAL_MS=1000
+# Optional per-stage overrides of the built-in downloadGapMs (svk=0, v4/eu=2000)
+# WARM_CACHE_GAP_MS_SVK=0
+# WARM_CACHE_GAP_MS_V4=2000
+# WARM_CACHE_GAP_MS_EU=2000
 BBOX_V4="12.0,45.7,24.2,55.0"
 BBOX_EU="-25,34,45,71"
 ```
 
-At the default interval that's up to 3600 thumbnails/hour while fully idle - negligible load on Wikimedia. Progress is visible in `/status` (`warmCacheDownloadedCount`, `warmCacheSkippedCount`, `warmCacheStage`, `warmCacheLaps`, `warmCacheCursor`) and `/metrics`.
+At the default interval that's up to 3600 thumbnails/hour during the SVK stage while fully idle, and 1800/hour once it reaches V4 or EU - negligible load on Wikimedia either way. Progress is visible in `/status` (`warmCacheDownloadedCount`, `warmCacheSkippedCount`, `warmCacheStage`, `warmCacheGapMs`, `warmCacheLaps`, `warmCacheCursor`) and `/metrics`.
 
 Logged to the **stats log** (`STAT_LOG_FILE`, default `logs/stat.log`) - deliberately separate from the error log, since these are milestones rather than failures. Both paths resolve relative to the app directory, not the working directory. (Not to be confused with `logs/import.log` - that one is import-only, see above.)
 - Every time a stage's bbox completes a full lap (`Completed lap N of stage 'svk'.`) and whenever it advances to the next stage (`Advancing to stage 'v4'.`) - so you can tell exactly when SVK (and later V4) has been fully pre-warmed.

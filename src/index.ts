@@ -430,6 +430,8 @@ router.get('/status', async (ctx) => {
     console.error('Error fetching db row count estimate', err);
   }
 
+  const currentWarmCacheStage = WARM_CACHE_STAGES[warmCacheState.stageIndex];
+
   ctx.body = {
     service: 'WikiMediaCache',
     version: pkgVersion,
@@ -447,7 +449,12 @@ router.get('/status', async (ctx) => {
     warmCacheEnabled: WARM_CACHE_ENABLED,
     warmCacheDownloadedCount,
     warmCacheSkippedCount,
-    warmCacheStage: WARM_CACHE_STAGES[warmCacheState.stageIndex]?.name,
+    warmCacheStage: currentWarmCacheStage?.name,
+    // Aktualne tempo: minimalny odstup medzi dvoma stiahnutiami v tejto etape
+    // (0 = tempo urcuje uz len WARM_CACHE_INTERVAL_MS). Bez `!` zamerne -
+    // pri poskodenom checkpointe (stageIndex mimo rozsahu) sa nema zosypat
+    // cely /status, presne ako to uz riesi `?.name` o riadok vyssie.
+    warmCacheGapMs: currentWarmCacheStage ? resolveStageGapMs(currentWarmCacheStage) : null,
     warmCacheLaps: warmCacheState.laps,
     warmCacheCursor: warmCacheState.cursor
   };
@@ -791,6 +798,30 @@ interface WarmCacheStage {
   // How many full laps of this stage's bbox before advancing to the next
   // stage. The last stage should use Infinity (never advances further).
   lapsBeforeAdvance: number;
+  // Minimalny odstup (ms) medzi dvoma REALNYMI stiahnutiami v tejto etape.
+  // 0 = ziadne dodatocne brzdenie, tempo urcuje uz len WARM_CACHE_INTERVAL_MS
+  // (1 stiahnutie za tick, teda 1/s pri defaulte).
+  //
+  // Preco to je per-etapa: SVK je maly a vysoko prioritny rozsah, ten chceme
+  // mat teply co najskor. Dalsie etapy su radovo vacsie a zaroven menej
+  // urgentne - domaci pouzivatel z nich vidi len zlomok - takze nema zmysel
+  // kvoli nim drzat trvalo vysoke tempo dopytov na Wikimediu. Spomalenim
+  // ostava na ich strane rezerva pre nahodne (user-driven) poziadavky
+  // odinakial z Europy, ktore prichadzaju neplanovane a nesmu narazit na
+  // rate limit, ktory sme vycerpali prehrievanim.
+  //
+  // Poznamka: brzdi sa len po realnom siahnuti na Wikimediu. Preskakovanie
+  // uz nacachovanych kandidatov (a to je pri dokolovanej etape vacsina
+  // prace) bezi dalej naplno - pozri warmCacheTick().
+  downloadGapMs: number;
+}
+
+// Odstup sa da prebit per etapu cez env, napr. WARM_CACHE_GAP_MS_V4=3000.
+function resolveStageGapMs(stage: WarmCacheStage): number {
+  const envVal = process.env[`WARM_CACHE_GAP_MS_${stage.name.toUpperCase()}`];
+  if (!envVal) return stage.downloadGapMs;
+  const parsed = parseInt(envVal, 10);
+  return Number.isNaN(parsed) ? stage.downloadGapMs : Math.max(0, parsed);
 }
 
 const SVK_DEFAULT_BBOX = [16.83, 47.73, 22.57, 49.61];
@@ -801,7 +832,8 @@ const V4_DEFAULT_BBOX = [12.0, 45.7, 24.2, 55.0];
 const EU_DEFAULT_BBOX = [-25, 34, 45, 71];
 
 const WARM_CACHE_STAGES: WarmCacheStage[] = [
-  { name: 'svk', bboxEnv: 'BBOX_SVK', defaultBbox: SVK_DEFAULT_BBOX, lapsBeforeAdvance: 1 },
+  // SVK: bez brzdy - maly, vysoko prioritny rozsah, chceme ho teply co najskor.
+  { name: 'svk', bboxEnv: 'BBOX_SVK', defaultBbox: SVK_DEFAULT_BBOX, lapsBeforeAdvance: 1, downloadGapMs: 0 },
   {
     name: 'v4',
     bboxEnv: 'BBOX_V4',
@@ -812,6 +844,8 @@ const WARM_CACHE_STAGES: WarmCacheStage[] = [
     // one more lap here should complete fast - most candidates will already
     // be cached and get skipped in the same tick (see warmCacheTick).
     lapsBeforeAdvance: 1,
+    // Od V4 dalej stahujeme najviac raz za 2 s namiesto raz za sekundu.
+    downloadGapMs: 2000,
   },
   {
     name: 'eu',
@@ -820,6 +854,7 @@ const WARM_CACHE_STAGES: WarmCacheStage[] = [
     excludeBboxEnv: 'BBOX_V4',
     excludeDefaultBbox: V4_DEFAULT_BBOX,
     lapsBeforeAdvance: Infinity,
+    downloadGapMs: 2000,
   },
 ];
 
@@ -894,10 +929,24 @@ function nextStageForAdvance(): WarmCacheStage {
 // stage really is fully cached" instead of "one *check* per tick".
 const WARM_CACHE_MAX_ATTEMPTS_PER_TICK = 500;
 
+// Kedy najskor smie warmer znova siahnut na Wikimediu (pozri downloadGapMs
+// pri WarmCacheStage). Tick, ktory pride skor, sa proste zahodi - nic sa tym
+// nestraca, kurzor ani davka sa nehybu.
+let warmCacheNextDownloadAt = 0;
+
 async function warmCacheTick() {
   if (!WARM_CACHE_ENABLED) return;
   // Real user traffic always has priority - never compete with it.
   if (prefetchQueue.length > 0 || prefetchWorkerRunning) return;
+  // Brzda pre pomalsie etapy - drzi odstup od PREDOSLEHO stiahnutia.
+  //
+  // Tolerancia pol ticku nie je kozmetika: tikame v pevnom rastri po
+  // WARM_CACHE_INTERVAL_MS, takze pauza takmer nikdy nedobehne presne na
+  // hranu ticku. Bez nej by sa vzdy zaokruhlovalo NAHOR na cely tick a
+  // downloadGapMs=2000 by pri 1s ticku v skutocnosti znamenalo odstup 3 s
+  // (1200 stiahnuti/h namiesto 1800) - nastavena hodnota by teda znamenala
+  // nieco ine, nez hovori. S toleranciou sa zaokruhluje na najblizsi tick.
+  if (Date.now() + WARM_CACHE_INTERVAL_MS / 2 < warmCacheNextDownloadAt) return;
 
   try {
     for (let attempt = 0; attempt < WARM_CACHE_MAX_ATTEMPTS_PER_TICK; attempt++) {
@@ -931,6 +980,11 @@ async function warmCacheTick() {
         writeErrorLog(`[warm-cache] Failed to download pageId ${pageId}: ${err.message}`);
       } finally {
         downloadSemaphore.release();
+        // Odstup sa pocita od KAZDEHO siahnutia na Wikimediu, aj neuspesneho -
+        // request odisiel a do ich rate limitu sa rata tak ci tak. A az odtialto,
+        // nie od zaciatku ticku, aby sa cakanie nezapocitavalo do trvania
+        // samotneho stahovania.
+        warmCacheNextDownloadAt = Date.now() + resolveStageGapMs(stage);
       }
       return; // downloaded (or tried to) one photo - done for this tick
     }
