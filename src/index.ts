@@ -62,6 +62,68 @@ if (allowedHashes.size === 0) {
 // nema odkial platny kluc vziat - a prave preto vracal /warm-cache-reset 401.
 const LOCAL_ADMIN_PATHS = new Set(['/warm-cache-reset', '/cleanup-cache']);
 
+// CORS pre webovú verziu Freemapu.
+//
+// Appka posiela `X-Freemap-API-Key`, čo z každého dopytu robí požiadavku
+// s predletom - a `OPTIONS` podľa špecifikácie nenesie ani vlastné hlavičky,
+// ani prihlasovacie údaje. Autorizácia nižšie ho teda musí odmietnuť, a
+// odmietnutý predlet zablokuje aj ten dopyt, ktorý by kľúčom prešiel. Preto
+// je toto medzivrstva PRED autorizáciou: predlet vybaví sama a k overovaniu
+// ho vôbec nepustí.
+//
+// Zoznam originov je uzavretý, nie `*`. Nie je to bezpečnostná hranica -
+// tou zostáva API kľúč - len to bráni cudzím stránkam ťahať si našu cache.
+const DEFAULT_ALLOWED_ORIGIN_HOSTS =
+  'freemap.sk,*.freemap.sk,freemap.eu,*.freemap.eu,freemap.bigware.sk';
+
+const originPatterns = (process.env.ALLOWED_ORIGIN_HOSTS ?? DEFAULT_ALLOWED_ORIGIN_HOSTS)
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// "*.freemap.sk" sedí na ľubovoľnú subdoménu, nie na holú doménu - tú treba
+// v zozname uviesť zvlášť.
+function originHostMatches(host: string, pattern: string): boolean {
+  return pattern.startsWith('*.') ? host.endsWith(pattern.slice(1)) : host === pattern;
+}
+
+// Origin je len schéma+host ("https://www.freemap.sk"). Môže byť aj doslova
+// "null" (sandboxované stránky) - to sa neparsuje, čo je presne tá odpoveď,
+// akú chceme.
+function originHost(value: string): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function isAllowedOrigin(host: string | null): boolean {
+  return !!host && originPatterns.some((p) => originHostMatches(host, p));
+}
+
+app.use(async (ctx, next) => {
+  ctx.vary('Origin');
+
+  const origin = ctx.get('Origin');
+  const allowed = isAllowedOrigin(originHost(origin));
+
+  if (allowed) {
+    ctx.set('Access-Control-Allow-Origin', origin);
+    ctx.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    ctx.set('Access-Control-Allow-Headers', 'X-Freemap-API-Key');
+    ctx.set('Access-Control-Max-Age', '86400');
+  }
+
+  if (ctx.method === 'OPTIONS') {
+    ctx.status = allowed ? 204 : 403;
+    return;
+  }
+
+  await next();
+});
+
 app.use(async (ctx, next) => {
   if (ctx.path === '/status' || ctx.path === '/metrics' ||
       LOCAL_ADMIN_PATHS.has(ctx.path)) {
