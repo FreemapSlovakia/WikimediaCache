@@ -87,9 +87,10 @@ function originHostMatches(host: string, pattern: string): boolean {
   return pattern.startsWith('*.') ? host.endsWith(pattern.slice(1)) : host === pattern;
 }
 
-// Origin je len schéma+host ("https://www.freemap.sk"). Môže byť aj doslova
-// "null" (sandboxované stránky) - to sa neparsuje, čo je presne tá odpoveď,
-// akú chceme.
+// Origin je len schéma+host ("https://www.freemap.sk"), Referer celá adresa
+// ("https://www.freemap.sk/mapa"); oboje sa parsuje ako URL a nás zaujíma len
+// hostiteľ. Origin môže byť aj doslova "null" (sandboxované stránky) - to sa
+// neparsuje, čo je presne tá odpoveď, akú chceme.
 function originHost(value: string): string | null {
   if (!value) return null;
   try {
@@ -132,13 +133,31 @@ app.use(async (ctx, next) => {
   
   const reqKey = ctx.get('X-Freemap-API-Key') || '';
   const reqHash = crypto.createHash('sha256').update(reqKey).digest('hex');
-  
-  if (!allowedHashes.has(reqHash)) {
-    ctx.status = 401;
-    ctx.body = 'Unauthorized';
-    return;
+
+  if (allowedHashes.has(reqHash)) {
+    return next();
   }
-  await next();
+
+  // Záloha pre prehliadač: náhľady sa načítavajú ako obrázky a tie vlastnú
+  // hlavičku nepošlú - kľúč teda nemá ako doraziť a webová verzia by dostala
+  // 401 na každú fotku. Rozhoduje preto hostiteľ stránky, z ktorej dopyt
+  // prišiel. Nie je to bezpečnostná hranica (referer sa dá podvrhnúť
+  // čímkoľvek, čo nie je prehliadač) - kľúč zostáva skutočným prihlásením,
+  // toto len drží cudzie stránky mimo našej cache. Rovnako to má radarová
+  // služba, viď RainViewerCache/auth.js.
+  const browserHost =
+    originHost(ctx.get('Referer')) ?? originHost(ctx.get('Origin'));
+
+  if (isAllowedOrigin(browserHost)) {
+    return next();
+  }
+
+  // no-store: odmietnutie sa nesmie zapamätať. Náhľady chodia s dlhým
+  // `Cache-Control` a spoločná cache by 401 podávala ďalej aj dávno po tom,
+  // čo sa kľúč či zoznam originov opraví.
+  ctx.set('Cache-Control', 'no-store');
+  ctx.status = 401;
+  ctx.body = 'Unauthorized';
 });
 
 class Semaphore {
