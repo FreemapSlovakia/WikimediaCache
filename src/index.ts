@@ -126,8 +126,8 @@ app.use(async (ctx, next) => {
 });
 
 app.use(async (ctx, next) => {
-  if (ctx.path === '/status' || ctx.path === '/metrics' ||
-      LOCAL_ADMIN_PATHS.has(ctx.path)) {
+  if (ctx.path === '/status' || ctx.path === '/health' ||
+      ctx.path === '/metrics' || LOCAL_ADMIN_PATHS.has(ctx.path)) {
     return next();
   }
   
@@ -494,6 +494,42 @@ let cacheMissesCount = 0;
 let cacheHitsCount = 0;
 let apiErrorCount = 0;
 let deadFilesCount = 0;
+
+/**
+ * Lacná kontrola pre monitoring (Uptime Kuma cez https://cache.bigware.sk/wikimedia/health).
+ *
+ * Zámerne nesiaha na cache adresár: `/status` volá `getCacheDirStats()`, ktoré
+ * vylistuje a `stat`-ne každý súbor v cache, takže pri veľkej cache beží
+ * minúty a cez nginx skončí na 504. Monitor by tým bol trvalo červený a každá
+ * kontrola by mlela disk. Tu sa preto robí len ping do databázy, a aj ten má
+ * strop — health check, ktorý sa vie zaseknúť, je horší než žiadny.
+ */
+router.get('/health', async (ctx) => {
+  let database = 'ok';
+
+  try {
+    await Promise.race([
+      getPool().query('SELECT 1'),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), 2000),
+      ),
+    ]);
+  } catch (err) {
+    database = 'down';
+    console.error('Health check: databáza neodpovedá', err);
+  }
+
+  // Bez databázy sa náhľad nedá vyhľadať, takže služba nie je v poriadku ani
+  // vtedy, keď proces beží — monitor to má vidieť ako výpadok.
+  ctx.status = database === 'ok' ? 200 : 503;
+  ctx.body = {
+    service: 'WikiMediaCache',
+    version: pkgVersion,
+    status: database === 'ok' ? 'ok' : 'degraded',
+    uptime: process.uptime(),
+    database,
+  };
+});
 
 router.get('/status', async (ctx) => {
   const now = Date.now();
