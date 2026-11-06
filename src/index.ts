@@ -16,12 +16,22 @@ import { Agent as HttpAgent } from 'http';
 import { Agent as HttpsAgent } from 'https';
 import sharp from 'sharp';
 import crypto from 'crypto';
+import { CACHE_DIR, listCacheFilesRecursive } from './cachePaths.js';
 import {
-  CACHE_DIR,
-  ensureShardDirsExist,
-  getCachePath,
-  listCacheFilesRecursive,
-} from './cachePaths.js';
+  clearThumbs,
+  closeThumbStore,
+  collectThumbRefsByPage,
+  countThumbs,
+  deleteThumb,
+  deleteThumbsAndLegacy,
+  getThumbOrLegacy,
+  hasThumbOrLegacy,
+  incrementalVacuum,
+  putThumb,
+  storeDiskBytes,
+  THUMB_DB_DIR,
+  type ThumbRef,
+} from './thumbStore.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config();
@@ -323,7 +333,7 @@ function logWikimediaError(context: string, err: any) {
   apiErrorCount++;
 }
 
-async function downloadThumbnailToCache(pageId: string, size: number, cachePath: string): Promise<void> {
+async function downloadThumbnailToCache(pageId: string, size: number): Promise<void> {
   writeLog(`[prefetch] Starting fetch for pageId ${pageId}...`);
   const apiUrl = `https://commons.wikimedia.org/w/api.php?action=query&prop=imageinfo&iiprop=url&iiurlwidth=${size}&pageids=${pageId}&format=json`;
   let apiResponse: any;
@@ -349,8 +359,7 @@ async function downloadThumbnailToCache(pageId: string, size: number, cachePath:
       </svg>
     `;
     const jpeg = await sharp(Buffer.from(svg)).jpeg().toBuffer();
-    fs.writeFileSync(cachePath, jpeg);
-    validCacheEntries.add(`${pageId}_${size}.jpg`);
+    putThumb(pageId, size, jpeg);
     writeLog(`[prefetch] pageId ${pageId} has no imageinfo (deleted). Saved cross placeholder.`);
     return;
   }
@@ -366,8 +375,7 @@ async function downloadThumbnailToCache(pageId: string, size: number, cachePath:
       }).buffer();
       if (buffer.length === 0) throw new Error('Empty response');
       const jpeg = await sharp(buffer).jpeg({ quality: 85 }).toBuffer();
-      fs.writeFileSync(cachePath, jpeg);
-      validCacheEntries.add(`${pageId}_${size}.jpg`);
+      putThumb(pageId, size, jpeg);
       successfulDownloadsSinceLastBlock++;
       writeLog(`[prefetch] SUCCESS: Saved pageId ${pageId} to cache. (Total successful in a row: ${successfulDownloadsSinceLastBlock})`);
       return;
@@ -407,12 +415,10 @@ async function runPrefetchWorker() {
       }
 
       prefetchQueued.delete(pageId);
-      const fileName = `${pageId}_120.jpg`;
-      if (validCacheEntries.has(fileName)) continue;
-      const cachePath = getCachePath(pageId, 120);
+      if (hasThumbOrLegacy(pageId, 120)) continue;
       await downloadSemaphore.acquire();
       try {
-        await downloadThumbnailToCache(pageId, 120, cachePath);
+        await downloadThumbnailToCache(pageId, 120);
         
         // Calculation: 25 Mbit/s = 3.125 MB/s = ~312 thumbs (10KB each) per second.
         // With 2 threads it's 156 thumbs/s per thread, which is a ~6ms pause.
@@ -429,17 +435,28 @@ async function runPrefetchWorker() {
   }
 }
 
+// Kontrola existencie je dopyt do SQLite (~5 µs) a počas migrácie aj `stat`
+// starého súboru - pri 5 000 až 50 000 id z /pictures?prefetch=true by to
+// držalo event loop desiatky až stovky ms. Preto po dávkach s setImmediate
+// medzi nimi, aby sa medzitým vybavovali náhľady. Dávky dobehnuté po
+// /cancel-prefetch zahodí worker (klient už nie je v activeClients).
+const ENQUEUE_CHUNK = 1000;
+
 function enqueuePrefetch(pageIds: string[], clientId: string) {
-  for (const id of pageIds) {
-    if (!prefetchQueued.has(id)) {
-      const fileName = `${id}_120.jpg`;
-      if (!validCacheEntries.has(fileName)) {
+  let i = 0;
+  const step = () => {
+    const end = Math.min(i + ENQUEUE_CHUNK, pageIds.length);
+    for (; i < end; i++) {
+      const id = pageIds[i]!;
+      if (!prefetchQueued.has(id) && !hasThumbOrLegacy(id, 120)) {
         prefetchQueued.add(id);
         prefetchQueue.push({ pageId: id, clientId });
       }
     }
-  }
-  if (!prefetchWorkerRunning) runPrefetchWorker().catch(() => {});
+    if (!prefetchWorkerRunning && prefetchQueue.length > 0) runPrefetchWorker().catch(() => {});
+    if (i < pageIds.length) setImmediate(step);
+  };
+  step();
 }
 
 // Standard thumbnail sizes per https://www.mediawiki.org/wiki/Common_thumbnail_sizes
@@ -451,18 +468,27 @@ function snapToStandardSize(requested: number): number {
   );
 }
 
+// Počet náhľadov a miesto na disku pre /status, /metrics a hodinový súhrn.
+// Kedysi sa tu listoval a `stat`-oval každý súbor (pri miliónoch minúty).
+// Teraz je to count(*) nad 64 shardmi - lacné, ale /status ho volá monitoring
+// často, preto sa výsledok drží minútu. `fileCount` sú riadky v SQLite;
+// súbory, ktoré migrácia ešte nepresunula, sa nerátajú (tie ukáže
+// `find cache -type f | wc -l`). `totalSize` je veľkosť .db/-wal súborov.
+const CACHE_STATS_TTL_MS = 60 * 1000;
+let cacheStatsMemo: { at: number; fileCount: number; totalSize: number } | null = null;
+
 async function getCacheDirStats(): Promise<{ fileCount: number; totalSize: number }> {
+  if (cacheStatsMemo && Date.now() - cacheStatsMemo.at < CACHE_STATS_TTL_MS) {
+    return { fileCount: cacheStatsMemo.fileCount, totalSize: cacheStatsMemo.totalSize };
+  }
   let fileCount = 0;
   let totalSize = 0;
   try {
-    const files = await listCacheFilesRecursive();
-    fileCount = files.length;
-    for (const relPath of files) {
-      const stats = await fs.promises.stat(path.join(CACHE_DIR, relPath)).catch(() => null);
-      if (stats) totalSize += stats.size;
-    }
+    fileCount = countThumbs();
+    totalSize = storeDiskBytes();
+    cacheStatsMemo = { at: Date.now(), fileCount, totalSize };
   } catch (err) {
-    console.error('Error reading cache dir stats', err);
+    console.error('Error reading thumb store stats', err);
   }
   return { fileCount, totalSize };
 }
@@ -489,7 +515,6 @@ function formatDuration(ms: number): string {
 }
 
 const activeClients = new Map<string, number>();
-const validCacheEntries = new Set<string>();
 let cacheMissesCount = 0;
 let cacheHitsCount = 0;
 let apiErrorCount = 0;
@@ -751,26 +776,29 @@ router.get('/wikimedia/thumbnail/:pageId', async (ctx) => {
     return;
   }
   const size = snapToStandardSize(parseInt(ctx.query['size'] as string) || 120);
-  const fileName = `${pageId}_${size}.jpg`;
-  const cachePath = getCachePath(pageId, size);
 
   const clientId = ctx.query['clientId'] as string;
   if (clientId) activeClients.set(clientId, Date.now());
-  
-  if (validCacheEntries.has(fileName)) {
-    if (fs.existsSync(cachePath)) {
-      const stat = fs.statSync(cachePath);
-      if (stat.size > 0) {
-        cacheHitsCount++;
-        ctx.set('Content-Type', 'image/jpeg');
-        ctx.set('Cache-Control', 'public, max-age=31536000');
-        ctx.body = fs.createReadStream(cachePath);
-        return;
-      }
-      fs.unlinkSync(cachePath);
+
+  // Synchrónne čítanie zo SQLite (desiatky µs), počas migrácie s návratom
+  // na starý súbor. Telo je Buffer, takže Koa nastaví Content-Length sám.
+  const hit = getThumbOrLegacy(pageId, size);
+  if (hit && hit.data.length > 0) {
+    cacheHitsCount++;
+    ctx.status = 200;
+    ctx.type = 'image/jpeg';
+    ctx.set('Cache-Control', 'public, max-age=31536000');
+    ctx.lastModified = new Date(hit.updated * 1000);
+    // If-Modified-Since: náhľad sa nemení, stačí 304 bez tela.
+    if (ctx.fresh) {
+      ctx.status = 304;
+      return;
     }
-    validCacheEntries.delete(fileName);
+    ctx.body = hit.data;
+    return;
   }
+  // Prázdny záznam by sa posielal donekonečna - zahodiť a stiahnuť znova.
+  if (hit) deleteThumb(pageId, size);
 
   // Not cached yet — enqueue for background download and return 503
   cacheMissesCount++;
@@ -781,20 +809,12 @@ router.get('/wikimedia/thumbnail/:pageId', async (ctx) => {
 
 async function runSpatialCleanup(minLon: number, minLat: number, maxLon: number, maxLat: number, mode: 'inside' | 'outside') {
   console.log(`[cleanup] Starting spatial cleanup (mode: ${mode}) for bbox: ${minLon},${minLat},${maxLon},${maxLat}`);
-  const files = await listCacheFilesRecursive(); // relative paths, e.g. "042/1234567_120.jpg"
-  const fileMap = new Map<number, string[]>(); // pageId -> relative paths
+  // Najprv celý zoznam (SQLite aj staré súbory), až potom mazanie: počas
+  // prechodu listThumbs() sa do toho istého shardu zapisovať nesmie.
+  const byPage = await collectThumbRefsByPage(); // pageId -> sizes
 
-  for (const relPath of files) {
-    const baseName = path.basename(relPath);
-    const pageId = parseInt(baseName.split('_')[0]!, 10);
-    if (!isNaN(pageId)) {
-      if (!fileMap.has(pageId)) fileMap.set(pageId, []);
-      fileMap.get(pageId)!.push(relPath);
-    }
-  }
-
-  const pageIds = Array.from(fileMap.keys());
-  let deletedCount = 0;
+  const pageIds = Array.from(byPage.keys());
+  const toDelete: ThumbRef[] = [];
   const BATCH = 5000;
   const pool = getPool();
 
@@ -812,42 +832,38 @@ async function runSpatialCleanup(minLon: number, minLat: number, maxLon: number,
       for (const id of batchIds) {
         const isInside = insideIds.has(id);
         const shouldDelete = mode === 'inside' ? isInside : !isInside;
-        
         if (shouldDelete) {
-          for (const relPath of fileMap.get(id)!) {
-            const cachePath = path.join(CACHE_DIR, relPath);
-            if (fs.existsSync(cachePath)) {
-              fs.unlinkSync(cachePath);
-              validCacheEntries.delete(path.basename(relPath));
-              deletedCount++;
-            }
-          }
+          for (const size of byPage.get(id)!) toDelete.push({ pageId: id, size });
         }
       }
     } catch (err) {
       console.error(`[cleanup] Error in batch ${i}:`, err);
     }
   }
-  console.log(`[cleanup] Finished spatial cleanup. Deleted ${deletedCount} files.`);
+
+  const { rows, files } = deleteThumbsAndLegacy(toDelete);
+  if (rows > 0) incrementalVacuum();
+  cacheStatsMemo = null;
+  console.log(`[cleanup] Finished spatial cleanup. Deleted ${rows} thumbnails from SQLite and ${files} legacy files.`);
 }
 
 async function runFullCleanup() {
   console.log('[cleanup] Starting full cache wipe...');
   try {
-    const files = await listCacheFilesRecursive();
-    // Wipe the shard subdirectories themselves (not just their contents) and
-    // recreate them empty, rather than unlinking one file at a time - a
-    // recursive rm is a single syscall-cheap operation regardless of how
-    // many files are inside, unlike iterating potentially millions of them.
+    const before = countThumbs();
+    clearThumbs();
+    // Staré súbory, ktoré migrácia ešte nepresunula - inak by ich
+    // getThumbOrLegacy() vrátil späť. Celé shard adresáre naraz, nie po
+    // súboroch; prázdne sa už nevytvárajú (do súborov sa nezapisuje).
+    const legacy = await listCacheFilesRecursive();
     const entries = await fs.promises.readdir(CACHE_DIR, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.isDirectory()) {
         await fs.promises.rm(path.join(CACHE_DIR, entry.name), { recursive: true, force: true });
       }
     }
-    ensureShardDirsExist();
-    validCacheEntries.clear();
-    console.log(`[cleanup] Finished full wipe. Deleted ${files.length} files.`);
+    cacheStatsMemo = null;
+    console.log(`[cleanup] Finished full wipe. Deleted ${before} thumbnails from SQLite and ${legacy.length} legacy files.`);
   } catch (err) {
     console.error('[cleanup] Error during full wipe:', err);
   }
@@ -1127,16 +1143,14 @@ async function warmCacheTick() {
 
       const pageId = warmCacheBatch.shift()!;
       warmCacheState.cursor = pageId;
-      const fileName = `${pageId}_120.jpg`;
-      if (validCacheEntries.has(fileName)) {
+      if (hasThumbOrLegacy(pageId, 120)) {
         warmCacheSkippedCount++;
         continue; // already warm - try the next candidate right away, same tick
       }
 
-      const cachePath = getCachePath(pageId, 120);
       await downloadSemaphore.acquire();
       try {
-        await downloadThumbnailToCache(String(pageId), 120, cachePath);
+        await downloadThumbnailToCache(String(pageId), 120);
         warmCacheDownloadedCount++;
         warmCacheDownloadedSinceLastSummary++;
       } catch (err: any) {
@@ -1217,17 +1231,17 @@ setInterval(() => {
 
 async function start() {
   await initDb();
-  ensureShardDirsExist();
 
-  try {
-    const files = await listCacheFilesRecursive();
-    for (const relPath of files) {
-      validCacheEntries.add(path.basename(relPath));
-    }
-    console.log(`Loaded ${validCacheEntries.size} cache entries into RAM.`);
-  } catch (err) {
-    console.error('Failed to load cache entries to RAM:', err);
-  }
+  // Náhľady sú v SQLite (thumbStore.ts). Zoznam do RAM sa už nenačítava -
+  // dopyt na jeden náhľad trvá desiatky µs. Otvorenie všetkých shardov tu
+  // zároveň overí, že better-sqlite3 a THUMB_DB_DIR sú v poriadku, skôr
+  // než prídu prvé dopyty.
+  const startedCount = Date.now();
+  const storedCount = countThumbs();
+  console.log(
+    `Thumb store ${THUMB_DB_DIR}: ${storedCount} thumbnails (${formatBytes(storeDiskBytes())}), ` +
+    `counted in ${Date.now() - startedCount} ms. Legacy files in ${CACHE_DIR} are read until migrated.`,
+  );
 
   const tokenStr = WIKIMEDIA_ACCESS_TOKEN ? `${WIKIMEDIA_ACCESS_TOKEN.substring(0, 15)}...` : 'NONE';
   const startupMsg = `[${new Date().toISOString()}] [STARTUP] WikiMediaCache started.\n` +
@@ -1240,8 +1254,31 @@ async function start() {
   writeStatLog(describeLastImport());
   setInterval(() => writeStatLog(describeLastImport()), 24 * 60 * 60 * 1000);
 
-  app.listen(PORT as number, '0.0.0.0', () => console.log(`WikiMediaCache service running on port ${PORT}`));
+  httpServer = app.listen(PORT as number, '0.0.0.0', () => console.log(`WikiMediaCache service running on port ${PORT}`));
 }
+
+let httpServer: ReturnType<typeof app.listen> | undefined;
+
+// pm2 restart/stop posiela SIGINT, systemd SIGTERM. SQLite vo WAL móde
+// náhly koniec prežije, ale korektné zatvorenie urobí checkpoint a zmaže
+// -wal/-shm. Nečaká sa na dobehnutie spojení (keep-alive by držal proces
+// dlhšie ako pm2 kill_timeout); rozbehnuté sťahovanie sa stratí, náhľad sa
+// stiahne pri ďalšom dopyte znova.
+let shuttingDown = false;
+function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal}: closing thumb store and exiting.`);
+  httpServer?.close();
+  try {
+    closeThumbStore();
+  } catch (err) {
+    console.error('[shutdown] closeThumbStore failed:', err);
+  }
+  process.exit(0);
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // Without these, an error thrown outside a request handler's own try/catch
 // (e.g. in a stray promise, a timer callback) crashes the process silently -
@@ -1251,11 +1288,13 @@ async function start() {
 // riskier than the crash itself).
 process.on('uncaughtException', (err) => {
   writeErrorLog(`[FATAL] Uncaught exception: ${err.stack || err.message}`);
+  try { closeThumbStore(); } catch (e) {}
   process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
   const msg = reason instanceof Error ? reason.stack || reason.message : String(reason);
   writeErrorLog(`[FATAL] Unhandled rejection: ${msg}`);
+  try { closeThumbStore(); } catch (e) {}
   process.exit(1);
 });
 

@@ -7,10 +7,23 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+
+// `.env` sa načíta už tu, nie až v index.ts: importy sa vyhodnotia skôr ako
+// telo index.ts, takže CACHE_DIR a THUMB_DB_DIR (thumbStore.ts) by inak
+// z `.env` nevideli nič. Hlavne migrateToSqlite.ts dotenv sám nevolá - bez
+// tohto by pri THUMB_DB_DIR v `.env` migrácia zapisovala inam, ako server
+// číta, a so --delete-source by súbory zmazala.
+dotenv.config({ quiet: true });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export const CACHE_DIR = path.join(__dirname, '../cache');
+// Starý adresár súborov (jeden JPEG na náhľad). Od presunu do SQLite
+// (thumbStore.ts) sa doň už nezapisuje, len sa z neho dočíta, kým migrácia
+// nedobehne. Premenná prostredia je kvôli testom na kópii.
+export const CACHE_DIR = process.env.CACHE_DIR
+  ? path.resolve(process.env.CACHE_DIR)
+  : path.join(__dirname, '../cache');
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }

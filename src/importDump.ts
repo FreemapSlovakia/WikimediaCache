@@ -12,7 +12,14 @@ import { pipeline } from 'stream/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getPool, initDb } from './database.js';
-import { CACHE_DIR, ensureShardDirsExist, listCacheFilesRecursive } from './cachePaths.js';
+import {
+  closeThumbStore,
+  collectThumbRefsByPage,
+  countThumbs,
+  deleteThumbsAndLegacy,
+  incrementalVacuum,
+  type ThumbRef,
+} from './thumbStore.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -274,22 +281,17 @@ async function cleanupDeletedThumbnails(pool: ReturnType<typeof getPool>) {
     return;
   }
 
-  const files = await listCacheFilesRecursive(); // relative paths, e.g. "042/1234567_120.jpg"
-  const fileMap = new Map<number, string[]>(); // pageId -> relative paths
+  // Celý zoznam najprv (SQLite aj staré súbory, ktoré migrácia ešte
+  // nepresunula), mazanie až potom: počas prechodu listThumbs() sa do toho
+  // istého shardu zapisovať nesmie.
+  const byPage = await collectThumbRefsByPage(); // pageId -> sizes
 
-  for (const relPath of files) {
-    const baseName = path.basename(relPath);
-    const pageId = parseInt(baseName.split('_')[0]!, 10);
-    if (!isNaN(pageId)) {
-      if (!fileMap.has(pageId)) fileMap.set(pageId, []);
-      fileMap.get(pageId)!.push(relPath);
-    }
-  }
+  const pageIds = Array.from(byPage.keys());
+  logImport('INFO', `Found ${pageIds.length} unique pageIds in cache (${countThumbs()} thumbnails in SQLite).`);
 
-  const pageIds = Array.from(fileMap.keys());
-  logImport('INFO', `Found ${pageIds.length} unique pageIds in cache.`);
-
-  let deletedCount = 0;
+  const toDelete: ThumbRef[] = [];
+  let obsoletePageIds = 0;
+  let failedBatches = 0;
   const BATCH = 5000;
   for (let i = 0; i < pageIds.length; i += BATCH) {
     const batchIds = pageIds.slice(i, i + BATCH);
@@ -299,30 +301,48 @@ async function cleanupDeletedThumbnails(pool: ReturnType<typeof getPool>) {
 
       for (const id of batchIds) {
         if (!existingIds.has(id)) {
-          for (const relPath of fileMap.get(id)!) {
-            const cachePath = path.join(CACHE_DIR, relPath);
-            if (fs.existsSync(cachePath)) {
-              fs.unlinkSync(cachePath);
-              deletedCount++;
-            }
-          }
+          obsoletePageIds++;
+          for (const size of byPage.get(id)!) toDelete.push({ pageId: id, size });
         }
       }
       process.stdout.write(`\rChecked ${Math.min(i + BATCH, pageIds.length)}/${pageIds.length} cached IDs...`);
     } catch (err: any) {
+      // Dávka, ktorú sa nepodarilo overiť, sa nemaže (nie je v toDelete).
+      failedBatches++;
       logImport('ERROR', `Error during cleanup batch: ${err.message}`);
     }
   }
-
   console.log('');
-  logImport('INFO', `Cache cleanup finished! Deleted ${deletedCount} obsolete thumbnails.`);
+
+  // Druhá poistka, rovnaká ako pri databáze: ak by sa mala zmazať viac ako
+  // polovica náhľadov, je chyba v importe, nie v cache. Teraz sa to dá
+  // skontrolovať, lebo sa najprv zbiera a až potom maže.
+  const limit = Math.floor(pageIds.length * 0.5);
+  if (obsoletePageIds > limit) {
+    logImport(
+      'ERROR',
+      `Cache cleanup ABORTED: ${obsoletePageIds} of ${pageIds.length} cached pageIds look obsolete, ` +
+        'which is more than half. That points to a bug, not to deleted photos - cache left untouched.',
+    );
+    return;
+  }
+
+  const { rows, files } = deleteThumbsAndLegacy(toDelete);
+  if (rows > 0) {
+    logImport('INFO', 'Returning freed SQLite pages to the filesystem (incremental_vacuum)...');
+    incrementalVacuum();
+  }
+  logImport(
+    'INFO',
+    `Cache cleanup finished! Deleted ${rows} obsolete thumbnails from SQLite and ${files} legacy files ` +
+      `(${obsoletePageIds} pageIds${failedBatches ? `, ${failedBatches} batches skipped on error` : ''}).`,
+  );
 }
 
 export async function runImport() {
   const startedAt = Date.now();
   logImport('INFO', '=== Import started ===');
   await initDb();
-  ensureShardDirsExist();
   const pool = getPool();
 
   if (fs.existsSync(DUMP_PATH)) {
@@ -363,7 +383,22 @@ export async function runImport() {
   }
 }
 
-runImport().then(() => process.exit(0)).catch(err => {
+// Ctrl+C / SIGTERM: zatvoriť SQLite korektne (checkpoint WAL). Import je
+// odolný voči prerušeniu (checkpoint v CHECKPOINT_PATH), mazanie náhľadov
+// prebieha po shardoch v transakciách.
+for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(sig, () => {
+    logImport('WARN', `=== Import interrupted by ${sig} ===`);
+    closeThumbStore();
+    process.exit(130);
+  });
+}
+
+runImport().then(() => {
+  closeThumbStore();
+  process.exit(0);
+}).catch(err => {
   logImport('ERROR', `=== Import FAILED: ${err.message} ===`);
+  closeThumbStore();
   process.exit(1);
 });

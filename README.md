@@ -44,8 +44,8 @@ GET /wikimedia/thumbnail/<pageId>?size=<pixels>
 Example: `/wikimedia/thumbnail/12345678?size=120` (size is optional, defaults to 120). The backend automatically snaps the requested size to standard Wikimedia thumbnail sizes (120, 250, 500...) to maximize cache hit rate.
 
 **Endpoint behavior and caching details:**
-- **In-RAM Index**: Upon startup, the service loads all existing filenames from the `/cache` directory into memory (`Set<string>`). This allows it to check if a file is already downloaded in `O(1)` time without any CPU-blocking `fs.existsSync` disk calls, dramatically improving performance during mass coordinate requests.
-- **Cache Hit**: If the thumbnail exists, it immediately returns the image (MIME type: `image/jpeg`).
+- **Storage**: Thumbnails live as BLOBs in SQLite (see [Cache storage](#cache-storage-sqlite)). A lookup is a primary-key read of tens of microseconds, so there is no in-RAM index of filenames any more and nothing is listed at startup.
+- **Cache Hit**: If the thumbnail exists, it immediately returns the image with `Content-Type: image/jpeg`, `Content-Length`, `Cache-Control: public, max-age=31536000` and `Last-Modified` (time the thumbnail was stored). A request with a matching `If-Modified-Since` gets `304 Not Modified`.
 - **Cache Miss (Queued)**: If the thumbnail is not downloaded yet, the backend adds it to an asynchronous download queue and returns **HTTP 503 Service Unavailable** with a `Retry-After: 15` header. The app shouldn't block, but rather silently retry fetching it later.
 - **Dead/Deleted files**: If the upstream Wikimedia API reports that the file no longer exists (e.g., `No imageinfo`), the server dynamically generates a small placeholder JPEG (a red cross on a gray background) and saves it permanently to the cache under the same pageId. Subsequent requests for this deleted file will return `200 OK` with the placeholder, thus preventing infinite retry loops from the mobile app.
 - **Queue Cleanup**: The background queue tracks the activity of each `clientId`. If a client disconnects or stops panning for more than 120 seconds, any pending downloads associated with their `clientId` are silently dropped to save bandwidth.
@@ -56,7 +56,7 @@ Example: `/wikimedia/thumbnail/12345678?size=120` (size is optional, defaults to
 GET /status
 ```
 
-Returns the current status of the service, uptime, and the number of images currently waiting in the background download queue. It also provides cache statistics.
+Returns the current status of the service, uptime, and the number of images currently waiting in the background download queue. It also provides cache statistics: `cachedFilesCount` is the number of thumbnails in SQLite and `cachedFilesSizeBytes` the size of the shard files (`.db` + `-wal`). Both are cached for one minute. Files the migration has not moved yet are not counted.
 
 ```json
 {
@@ -223,15 +223,41 @@ If `api_keys.txt` is missing or empty, the server will reject all API requests w
 
 The table and spatial index are created automatically on first start.
 
-## Cache storage (sharded)
+## Cache storage (SQLite)
 
-Thumbnails are stored on disk under `cache/<shard>/<pageId>_<size>.jpg`, where `<shard>` is `pageId % 1000` zero-padded to 3 digits (`000`-`999`) - see `src/cachePaths.ts`. A single flat directory doesn't scale well once the [idle cache warmer](#idle-cache-warmer)'s staged SVK -> V4 -> EU escalation pushes the file count into the hundreds of thousands or millions: `readdir()`/`stat()` passes (used by `/status`, `/metrics`, cleanup, migration) get noticeably slower, and `/status` in particular is polled frequently by uptime monitoring. Sharding keeps each directory's file count to roughly 1/1000th of the total.
+Thumbnails are BLOBs in 64 SQLite files, `thumbs-db/thumbs-00.db` … `thumbs-63.db` next to `cache/` (`THUMB_DB_DIR` overrides the directory), see `src/thumbStore.ts`. Shard = `pageId % 64`, table `thumb(id INTEGER PRIMARY KEY, data BLOB, updated INTEGER)`, key `pageId * 4096 + size`. WAL mode, `synchronous=NORMAL`, `auto_vacuum=INCREMENTAL`, so the server, `importDump.ts` and the migration can run at the same time. Each `-wal` file can grow to ~4–5 MB (SQLite reuses it, it does not shrink while the server runs); they disappear on a clean shutdown (SIGINT/SIGTERM).
 
-**If upgrading from an older, unsharded cache** (files sitting directly in `cache/`), run the one-time migration **before** starting the server:
+Why: one file per ~5 KB thumbnail exhausts ext4 inodes (3.7 M files filled 97 % of the inodes on cloud01). `page_size` is 4096 (`THUMB_DB_PAGE_SIZE`, only used when a shard file is created): on a 30 000 thumbnail sample it needed 18 % over the raw JPEG bytes, 8192 needed 36 %, and the read time was the same (~15 µs).
+
+Environment variables (also read from `.env`, by every script):
+
+- `THUMB_DB_DIR` - directory of the shard files (default `thumbs-db/`).
+- `THUMB_DB_PAGE_SIZE` - page size for new shard files (default 4096).
+- `CACHE_DIR` - legacy file cache (default `cache/`), only read during the migration.
+
+### Migrating the legacy file cache
+
+The old layout was `cache/<shard>/<pageId>_<size>.jpg` with `<shard>` = `pageId % 1000`. Until the migration finishes the server reads SQLite first and falls back to the old file (copying a hit into SQLite); it never writes files any more.
+
 ```bash
-npm run migrate-cache-shards
+npx tsx src/migrateToSqlite.ts --limit 10000      # trial, keeps the files
+npx tsx src/migrateToSqlite.ts --delete-source    # copy, read back, compare, delete the file
 ```
-It moves existing files into their shard subdirectories (safe to re-run; only touches files still directly in `cache/`). A fresh/empty cache needs no migration - shard subdirectories are created automatically on startup.
+
+A file is deleted only after its bytes were read back from SQLite and match. Re-running is safe (existing rows are kept). Ctrl+C finishes the current batch, prints the summary and stops; a second Ctrl+C exits at once. The summary must show `mismatch: 0` and `readErrors: 0`. `skippedName` counts files whose path does not round-trip through `getCachePath()` (junk such as `.DS_Store`, `*.part`, files directly in `cache/` from before sharding, a file in the wrong shard); they are listed (first 20) and never deleted. `skippedEmpty` counts 0-byte files, also kept.
+
+Files sitting directly in `cache/` (unsharded leftovers) are skipped; move them into shards first with `npm run migrate-cache-shards` if there are any (`find cache -maxdepth 1 -type f | wc -l`).
+
+### Backup
+
+Copying a live `.db` file is not enough (WAL). Back up shard by shard, e.g.
+
+```bash
+mkdir -p /root/thumbs-backup
+for f in thumbs-db/thumbs-*.db; do sqlite3 "$f" ".backup /root/thumbs-backup/$(basename "$f")"; done
+```
+
+or `VACUUM INTO '/path/thumbs-XX.db'` per shard, then copy the directory to the backup server.
 
 ## Running the server
 
@@ -263,7 +289,7 @@ This script includes several advanced mechanisms to ensure reliability:
   rm /tmp/geo_tags.sql.gz
   ```
 - **Deduplication (ON CONFLICT protection)**: The SQL dump often contains duplicate photos sequentially. The script deduplicates batches before sending them to PostgreSQL, protecting the database from `ON CONFLICT` row update errors.
-- **Automatic Cache Cleanup**: After the database import completes, the script scans the `/cache` directory. It cross-references all downloaded thumbnails with the newly imported database records. Any thumbnail whose `page_id` no longer exists in the updated Wikimedia dump (e.g., deleted images) is automatically unlinked and permanently deleted from the disk to free up space.
+- **Automatic Cache Cleanup**: After the database import completes, the script lists all thumbnails (SQLite plus any legacy files not migrated yet) and cross-references them with the newly imported database records. Thumbnails whose `page_id` no longer exists in the updated Wikimedia dump (e.g., deleted images) are deleted, then `incremental_vacuum` returns the space to the filesystem. Two guards: nothing is deleted when the photo table is empty, and nothing is deleted when more than half of the cached pageIds would go (that points to a broken import, not to deleted photos).
 - **Import Log**: Every run appends timestamped `INFO`/`WARN`/`ERROR` lines to `logs/import.log` (start/end markers, resume points, record counts, errors) - independent of whatever shell redirection you use to run it, so you always have a durable record of the last run's outcome. After each successful import it logs the total photo count and how many of those are within Slovakia (`BBOX_SVK`), and it also resets the [idle cache warmer](#idle-cache-warmer) back to the SVK stage since the fresh dump may include new Slovak photos.
 
 ## Updating data

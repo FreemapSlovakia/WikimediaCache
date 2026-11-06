@@ -10,3 +10,4 @@ cache/
 *.part
 *.checkpoint
 .DS_Store
+thumbs-db/
