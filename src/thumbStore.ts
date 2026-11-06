@@ -30,13 +30,37 @@ export const THUMB_DB_DIR = path.resolve(
   process.env.THUMB_DB_DIR || path.join(path.dirname(CACHE_DIR), 'thumbs-db'),
 );
 
-// runFullCleanup() (index.ts) removes every subdirectory of CACHE_DIR; shards
-// inside it would be deleted while open. Same directory is just as bad.
-{
-  const rel = path.relative(CACHE_DIR, THUMB_DB_DIR);
-  if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
-    throw new Error(`thumbStore: THUMB_DB_DIR (${THUMB_DB_DIR}) must not be inside CACHE_DIR (${CACHE_DIR})`);
+/**
+ * Physical path: realpath of the nearest existing ancestor plus the missing
+ * rest, so a symlinked CACHE_DIR (cache moved to another disk) is compared
+ * by where the files really live, even before THUMB_DB_DIR exists.
+ */
+export function physicalPath(p: string): string {
+  let cur = path.resolve(p);
+  const rest: string[] = [];
+  while (!fs.existsSync(cur)) {
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    rest.unshift(path.basename(cur));
+    cur = parent;
   }
+  return path.join(fs.realpathSync(cur), ...rest);
+}
+
+/** True when [child] is [parent] itself or lies anywhere below it. */
+export function isInsideOrSame(parent: string, child: string): boolean {
+  const rel = path.relative(physicalPath(parent), physicalPath(child));
+  if (rel === '') return true;
+  if (path.isAbsolute(rel)) return false;
+  // Only a whole `..` component leaves the tree; `..thumbs` is a child.
+  return !(rel === '..' || rel.startsWith('..' + path.sep));
+}
+
+// runFullCleanup() (index.ts) removes every subdirectory of CACHE_DIR; shards
+// inside it would be deleted while open. Same directory is just as bad
+// (review WMC06: also names starting with `..` and symlinks).
+if (isInsideOrSame(CACHE_DIR, THUMB_DB_DIR)) {
+  throw new Error(`thumbStore: THUMB_DB_DIR (${THUMB_DB_DIR}) must not be inside CACHE_DIR (${CACHE_DIR})`);
 }
 
 /**
