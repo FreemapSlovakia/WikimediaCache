@@ -17,6 +17,7 @@ import { Agent as HttpsAgent } from 'https';
 import sharp from 'sharp';
 import crypto from 'crypto';
 import { CACHE_DIR, listCacheFilesRecursive } from './cachePaths.js';
+import { describePlan, planSpatialCleanup } from './spatialCleanup.js';
 import {
   clearThumbs,
   closeThumbStore,
@@ -30,7 +31,6 @@ import {
   putThumb,
   storeDiskBytes,
   THUMB_DB_DIR,
-  type ThumbRef,
 } from './thumbStore.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -807,41 +807,35 @@ router.get('/wikimedia/thumbnail/:pageId', async (ctx) => {
   ctx.set('Retry-After', '15');
 });
 
-async function runSpatialCleanup(minLon: number, minLat: number, maxLon: number, maxLat: number, mode: 'inside' | 'outside') {
-  console.log(`[cleanup] Starting spatial cleanup (mode: ${mode}) for bbox: ${minLon},${minLat},${maxLon},${maxLat}`);
+async function runSpatialCleanup(
+  minLon: number,
+  minLat: number,
+  maxLon: number,
+  maxLat: number,
+  mode: 'inside' | 'outside',
+  opts: { dryRun: boolean; force: boolean },
+) {
+  console.log(
+    `[cleanup] Starting spatial cleanup (mode: ${mode}${opts.dryRun ? ', dry run' : ''}${opts.force ? ', force' : ''}) ` +
+      `for bbox: ${minLon},${minLat},${maxLon},${maxLat}`,
+  );
   // Najprv celý zoznam (SQLite aj staré súbory), až potom mazanie: počas
   // prechodu listThumbs() sa do toho istého shardu zapisovať nesmie.
   const byPage = await collectThumbRefsByPage(); // pageId -> sizes
-
-  const pageIds = Array.from(byPage.keys());
-  const toDelete: ThumbRef[] = [];
-  const BATCH = 5000;
-  const pool = getPool();
-
-  for (let i = 0; i < pageIds.length; i += BATCH) {
-    const batchIds = pageIds.slice(i, i + BATCH);
-    try {
-      const query = `
-        SELECT page_id FROM wikimedia_photo 
-        WHERE page_id = ANY($1::int[]) 
-        AND location && ST_MakeEnvelope($2, $3, $4, $5, 4326)
-      `;
-      const res = await pool.query(query, [batchIds, minLon, minLat, maxLon, maxLat]);
-      const insideIds = new Set(res.rows.map(r => r.page_id));
-
-      for (const id of batchIds) {
-        const isInside = insideIds.has(id);
-        const shouldDelete = mode === 'inside' ? isInside : !isInside;
-        if (shouldDelete) {
-          for (const size of byPage.get(id)!) toDelete.push({ pageId: id, size });
-        }
-      }
-    } catch (err) {
-      console.error(`[cleanup] Error in batch ${i}:`, err);
-    }
+  const plan = await planSpatialCleanup(byPage, getPool(), [minLon, minLat, maxLon, maxLat], mode, {
+    force: opts.force,
+  });
+  console.log(`[cleanup] Plan: ${describePlan(plan)}`);
+  if (plan.refused) {
+    console.error(`[cleanup] Spatial cleanup REFUSED, nothing deleted: ${plan.refused}`);
+    return;
+  }
+  if (opts.dryRun) {
+    console.log('[cleanup] Dry run, nothing deleted.');
+    return;
   }
 
-  const { rows, files } = deleteThumbsAndLegacy(toDelete);
+  const { rows, files } = deleteThumbsAndLegacy(plan.toDelete);
   if (rows > 0) incrementalVacuum();
   cacheStatsMemo = null;
   console.log(`[cleanup] Finished spatial cleanup. Deleted ${rows} thumbnails from SQLite and ${files} legacy files.`);
@@ -918,12 +912,19 @@ router.get('/cleanup-cache', async (ctx) => {
     ctx.status = 400; ctx.body = 'Mode must be outside or inside'; return;
   }
 
-  runSpatialCleanup(bbox[0]!, bbox[1]!, bbox[2]!, bbox[3]!, mode as 'inside'|'outside').catch(err => {
+  // dry=true: iba vypíše plán (inside/outside/unknown, koľko by sa zmazalo).
+  // force=true: povolí zmazať viac ako polovicu cache (inak odmietne).
+  const dryRun = ctx.query['dry'] === 'true';
+  const force = ctx.query['force'] === 'true';
+  runSpatialCleanup(bbox[0]!, bbox[1]!, bbox[2]!, bbox[3]!, mode as 'inside'|'outside', { dryRun, force }).catch(err => {
     console.error('Spatial cleanup error', err);
   });
 
   ctx.status = 202;
-  ctx.body = { status: 'Accepted', message: `Cleanup started for mode: ${mode}, bbox: ${bbox}` };
+  ctx.body = {
+    status: 'Accepted',
+    message: `Cleanup started for mode: ${mode}, bbox: ${bbox}${dryRun ? ' (dry run)' : ''}${force ? ' (force)' : ''}. Result in the server log.`,
+  };
 });
 
 app.use(router.routes()).use(router.allowedMethods());

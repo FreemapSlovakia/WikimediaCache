@@ -97,6 +97,10 @@ A powerful background task that scans all downloaded thumbnails and deletes thos
 - `region`: Use predefined bounding boxes. Available options: `svk`, `svk_cz`, or `all` (completely wipes the entire cache directory, bypassing spatial checks).
 - `bbox`: Use a custom bounding box: `minLon,minLat,maxLon,maxLat`.
 - `mode`: `outside` (default, deletes everything outside the bbox) or `inside` (deletes everything inside the bbox).
+- `dry=true`: only logs the plan (how many cached pageIds are inside, outside, unknown, and how many would be deleted); nothing is deleted.
+- `force=true`: allows deleting more than half of the cached pageIds (refused otherwise).
+
+**Guards** (`src/spatialCleanup.ts`): only thumbnails whose photo is in `wikimedia_photo` **with a location** are classified as inside or outside. A pageId missing from the table, or without a location, is *unknown* and always kept: absence from the geotag table is no proof that it lies outside the bbox. The cleanup is refused when the photo table is empty, and when more than half of the cached pageIds would be deleted without `force=true`. A batch whose query fails deletes nothing. Run with `dry=true` first and read the plan in the server log. `region=all` is a different, explicitly total wipe and has none of these checks.
 
 **Security**: This endpoint checks `ctx.ip` and rejects any request that doesn't originate from `127.0.0.1` or `::1` (returns `403 Forbidden`).
 
