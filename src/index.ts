@@ -19,6 +19,13 @@ import crypto from 'crypto';
 import { CACHE_DIR, listCacheFilesRecursive } from './cachePaths.js';
 import { describePlan, planSpatialCleanup } from './spatialCleanup.js';
 import {
+  classifyImageInfo,
+  isPlaceholder,
+  PLACEHOLDER_MAX_AGE_S,
+  placeholderExpired,
+  storeMissingPlaceholder,
+} from './imageInfo.js';
+import {
   clearThumbs,
   closeThumbStore,
   collectThumbRefsByPage,
@@ -348,22 +355,24 @@ async function downloadThumbnailToCache(pageId: string, size: number): Promise<v
     throw err;
   }
   
-  const pages = apiResponse.query?.pages as Record<string, any> | undefined;
-  if (!pages || !pages[pageId]?.imageinfo) {
+  const info = classifyImageInfo(apiResponse, pageId);
+  if (info.kind === 'error') {
+    // Dočasná chyba (maxlag, ratelimited, neúplná odpoveď): nič sa neukladá,
+    // pri ďalšej požiadavke sa skúsi znova.
+    apiErrorCount++;
+    throw new Error(`Wikimedia API answer for pageId ${pageId} not usable: ${info.reason}`);
+  }
+  if (info.kind === 'missing') {
     deadFilesCount++;
-    const svg = `
-      <svg width="${size}" height="${size}" xmlns="http://www.w3.org/2000/svg">
-        <rect width="100%" height="100%" fill="#f8f9fa"/>
-        <line x1="20%" y1="20%" x2="80%" y2="80%" stroke="#dc3545" stroke-width="4"/>
-        <line x1="80%" y1="20%" x2="20%" y2="80%" stroke="#dc3545" stroke-width="4"/>
-      </svg>
-    `;
-    const jpeg = await sharp(Buffer.from(svg)).jpeg().toBuffer();
-    putThumb(pageId, size, jpeg);
-    writeLog(`[prefetch] pageId ${pageId} has no imageinfo (deleted). Saved cross placeholder.`);
+    const stored = await storeMissingPlaceholder(pageId, size);
+    writeLog(
+      stored
+        ? `[prefetch] pageId ${pageId}: ${info.reason}. Saved cross placeholder.`
+        : `[prefetch] pageId ${pageId}: ${info.reason}, but a thumbnail already exists - kept it.`,
+    );
     return;
   }
-  const thumbUrl = pages[pageId].imageinfo[0].thumburl as string;
+  const thumbUrl = info.thumbUrl;
   writeLog(`[prefetch] API success for pageId ${pageId}, found URL: ${thumbUrl}. Downloading image...`);
 
   for (let attempt = 1; attempt <= 5; attempt++) {
@@ -782,12 +791,18 @@ router.get('/wikimedia/thumbnail/:pageId', async (ctx) => {
 
   // Synchrónne čítanie zo SQLite (desiatky µs), počas migrácie s návratom
   // na starý súbor. Telo je Buffer, takže Koa nastaví Content-Length sám.
-  const hit = getThumbOrLegacy(pageId, size);
+  let hit = getThumbOrLegacy(pageId, size);
+  // Krížik za chýbajúcu fotku platí týždeň, potom sa fotka skúsi znova.
+  const placeholder = hit !== undefined && isPlaceholder(hit.data);
+  if (hit && placeholder && placeholderExpired(hit.updated)) {
+    deleteThumb(pageId, size);
+    hit = undefined;
+  }
   if (hit && hit.data.length > 0) {
     cacheHitsCount++;
     ctx.status = 200;
     ctx.type = 'image/jpeg';
-    ctx.set('Cache-Control', 'public, max-age=31536000');
+    ctx.set('Cache-Control', `public, max-age=${placeholder ? PLACEHOLDER_MAX_AGE_S : 31536000}`);
     ctx.lastModified = new Date(hit.updated * 1000);
     // If-Modified-Since: náhľad sa nemení, stačí 304 bez tela.
     if (ctx.fresh) {
