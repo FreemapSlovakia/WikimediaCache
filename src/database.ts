@@ -36,6 +36,26 @@ export async function initDb() {
       ON wikimedia_photo USING GIST (location)
     `);
 
+    // `coarse`: geotag s najviac jedným desatinným miestom v oboch súradniciach.
+    // Tak sú otagované zábery Zeme z ISS (napr. 40.2, 6.4 — stanica letela
+    // nad morom) a iné družicové snímky; dump o nich inak nič nehovorí. Také
+    // body sa predvolene nevracajú (`/pictures?iss=1` ich vráti). Stĺpec sa
+    // pri prvom pridaní naplní z existujúcich riadkov; import ho ďalej
+    // udržiava z reťazca v dumpe (presnejšie než z čísla).
+    const col = await client.query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'wikimedia_photo' AND column_name = 'coarse'`,
+    );
+    if (col.rowCount === 0) {
+      await client.query(`ALTER TABLE wikimedia_photo ADD COLUMN coarse BOOLEAN NOT NULL DEFAULT false`);
+      const res = await client.query(`
+        UPDATE wikimedia_photo SET coarse = true
+        WHERE abs(ST_X(location) * 10 - round(ST_X(location) * 10)) < 1e-7
+          AND abs(ST_Y(location) * 10 - round(ST_Y(location) * 10)) < 1e-7
+      `);
+      console.log(`Marked ${res.rowCount} photos with coarse (ISS-like) coordinates.`);
+    }
+
     console.log('Database schema initialized.');
   } catch (error) {
     console.error('Error initializing database schema:', error);

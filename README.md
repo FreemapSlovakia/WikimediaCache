@@ -21,7 +21,19 @@ Returns a list of photos within the bounding box:
 ]
 ```
 
-Returns up to 5000 results. Full original metadata (author, license, description) is still fetched directly from the Wikimedia API on demand in the mobile app.
+Returns up to 5000 results by default. Optional parameters:
+
+- `limit=<1..50000>` — result budget for this request (default 5000).
+- `cells=<1..64>` — stratified sample: the bbox is split into `cells × cells`
+  grid cells and each cell returns at most `limit / cells²` photos (newest
+  first). Without it a big city eats the whole budget and the countryside
+  around it comes back empty. With `cells` every photo also carries `n`, the
+  true number of photos in its cell, so a client can draw density even though
+  the sample itself is capped.
+- `iss=1` — include photos with coarse coordinates (at most one decimal in
+  both lat and lon). Those are mostly Earth-observation shots from the ISS and
+  satellites, geotagged with the nadir point (often at sea); they are flagged
+  `coarse` at import and skipped by default. Full original metadata (author, license, description) is still fetched directly from the Wikimedia API on demand in the mobile app.
 
 ### 2. Fetching thumbnail (Cached Thumbnail)
 

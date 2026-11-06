@@ -667,6 +667,9 @@ router.get('/cancel-prefetch', (ctx) => {
   ctx.body = { status: 'ok', removedCount };
 });
 
+const PICTURES_LIMIT = 5000;
+const PICTURES_LIMIT_MAX = 50000;
+
 router.get('/pictures', async (ctx) => {
   const { bbox, clientId } = ctx.query;
   if (typeof clientId === 'string' && clientId) activeClients.set(clientId, Date.now());
@@ -674,18 +677,61 @@ router.get('/pictures', async (ctx) => {
   const parts = bbox.split(',').map(Number);
   if (parts.length !== 4 || parts.some(isNaN)) return;
   const [minLon, minLat, maxLon, maxLat] = parts;
+  // `cells=N`: stratifikovaná vzorka. Bbox sa rozdelí na N×N buniek a každá
+  // vráti najviac LIMIT/N² bodov. Bez toho `LIMIT 5000` podľa page_id zje
+  // veľkomesto celú vzorku (Budapešť: 95 % bodov v centre, okolie prázdne)
+  // a na mape vidno hrany dlaždíc, kde susedná dlaždica bez mesta má bodov
+  // všade. Cena je rovnaká: jeden sken obálky a jedno triedenie, len podľa
+  // (bunka, page_id) namiesto page_id.
+  const cellsRaw = parseInt(String(ctx.query['cells'] ?? ''), 10);
+  const cells = Number.isFinite(cellsRaw) ? Math.min(Math.max(cellsRaw, 0), 64) : 0;
+  // `limit=N` (1–50000, predvolene 5000): rozpočet bodov na dopyt. Pri
+  // stratifikácii je to zároveň to, čo rozhoduje, či mesto vyjde plné —
+  // 5000/64 buniek = 78 na bunku je pod bežným vidiekom a všetko sa zrovná.
+  const limitRaw = parseInt(String(ctx.query['limit'] ?? ''), 10);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), PICTURES_LIMIT_MAX) : PICTURES_LIMIT;
+  // `iss=1`: vrátiť aj body s hrubou polohou (zábery z ISS a družíc, pozri
+  // `coarse` v database.ts). Predvolene sa vynechávajú — nad morom aj vo
+  // vnútrozemí ukazovali fotky, ktoré na zemi nie sú.
+  const includeCoarse = ctx.query['iss'] === '1' || ctx.query['iss'] === 'true';
+  const coarseCond = includeCoarse ? '' : 'AND NOT coarse';
   try {
-    const query = `
+    // S `cells` nesie každý bod aj `n` — skutočný počet fotiek v jeho bunke
+    // (COUNT(*) OVER tou istou partíciou, bez ďalšieho prechodu). Klient tak
+    // vie kresliť hustotu, hoci vzorka je orezaná na limit/N² na bunku.
+    const query = cells > 0
+      ? `
+      SELECT page_id, lon, lat, n FROM (
+        SELECT page_id, lon, lat,
+               ROW_NUMBER() OVER (PARTITION BY cx, cy ORDER BY page_id DESC) AS rn,
+               COUNT(*) OVER (PARTITION BY cx, cy)::int AS n
+        FROM (
+          SELECT page_id, ST_X(location) AS lon, ST_Y(location) AS lat,
+                 LEAST(FLOOR((ST_X(location) - $1) / (($3 - $1) / $5)), $5 - 1) AS cx,
+                 LEAST(FLOOR((ST_Y(location) - $2) / (($4 - $2) / $5)), $5 - 1) AS cy
+          FROM wikimedia_photo
+          WHERE location && ST_MakeEnvelope($1, $2, $3, $4, 4326) ${coarseCond}
+        ) c
+      ) t
+      WHERE rn <= $6
+      LIMIT $7
+    `
+      : `
       SELECT page_id, ST_X(location) as lon, ST_Y(location) as lat 
       FROM wikimedia_photo 
-      WHERE location && ST_MakeEnvelope($1, $2, $3, $4, 4326)
+      WHERE location && ST_MakeEnvelope($1, $2, $3, $4, 4326) ${coarseCond}
       ORDER BY page_id DESC
-      LIMIT 5000
+      LIMIT $5
     `;
-    const result = await getPool().query(query, [minLon, minLat, maxLon, maxLat]);
+    const params = cells > 0
+      ? [minLon, minLat, maxLon, maxLat, cells, Math.max(1, Math.ceil(limit / (cells * cells))), limit]
+      : [minLon, minLat, maxLon, maxLat, limit];
+    const result = await getPool().query(query, params);
     const rows = result.rows
       .filter(row => isFinite(row.lat) && isFinite(row.lon))
-      .map(row => ({ pageId: row.page_id, lat: row.lat, lon: row.lon }));
+      .map(row => (cells > 0
+        ? { pageId: row.page_id, lat: row.lat, lon: row.lon, n: row.n }
+        : { pageId: row.page_id, lat: row.lat, lon: row.lon }));
     ctx.body = rows;
     
     if (ctx.query['prefetch'] === 'true' && typeof clientId === 'string') {

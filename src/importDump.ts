@@ -75,6 +75,7 @@ async function logImportSummary(pool: ReturnType<typeof getPool>) {
 
 const DUMP_URL = process.env.DUMP_URL || 'https://dumps.wikimedia.org/commonswiki/latest/commonswiki-latest-geo_tags.sql.gz';
 const BATCH_SIZE = process.env.BATCH_SIZE ? parseInt(process.env.BATCH_SIZE, 10) : 5000;
+const COARSE_RE = /^-?\d+(\.\d)?$/;
 const DUMP_PATH = process.env.DUMP_PATH || '/tmp/geo_tags.sql.gz';
 const CHECKPOINT_PATH = process.env.CHECKPOINT_PATH || '/tmp/geo_tags_import.checkpoint';
 
@@ -143,7 +144,7 @@ async function processDump(pool: ReturnType<typeof getPool>) {
     crlfDelay: Infinity,
   });
 
-  let batch: { pageId: number; lat: number; lon: number }[] = [];
+  let batch: { pageId: number; lat: number; lon: number; coarse: boolean }[] = [];
   let totalInserted = 0;
   let lastGtId = skipUntilGtId;
   const tupleRegex = /\(([^)]+)\)/g;
@@ -152,25 +153,25 @@ async function processDump(pool: ReturnType<typeof getPool>) {
     if (batch.length === 0) return;
 
     // Deduplicate by page_id to prevent "ON CONFLICT DO UPDATE command cannot affect row a second time"
-    const map = new Map<number, { pageId: number; lat: number; lon: number }>();
+    const map = new Map<number, { pageId: number; lat: number; lon: number; coarse: boolean }>();
     for (const item of batch) {
       map.set(item.pageId, item);
     }
     const currentBatch = Array.from(map.values());
     batch = [];
 
-    let query = 'INSERT INTO wikimedia_photo (page_id, location) VALUES ';
+    let query = 'INSERT INTO wikimedia_photo (page_id, location, coarse) VALUES ';
     const values: any[] = [];
     const placeholders: string[] = [];
 
     let paramIndex = 1;
     for (const item of currentBatch) {
-      placeholders.push(`($${paramIndex++}, ST_SetSRID(ST_MakePoint($${paramIndex++}, $${paramIndex++}), 4326))`);
-      values.push(item.pageId, item.lon, item.lat);
+      placeholders.push(`($${paramIndex++}, ST_SetSRID(ST_MakePoint($${paramIndex++}, $${paramIndex++}), 4326), $${paramIndex++})`);
+      values.push(item.pageId, item.lon, item.lat, item.coarse);
     }
 
     query += placeholders.join(', ');
-    query += ' ON CONFLICT (page_id) DO UPDATE SET location = EXCLUDED.location, updated_at = CURRENT_TIMESTAMP';
+    query += ' ON CONFLICT (page_id) DO UPDATE SET location = EXCLUDED.location, coarse = EXCLUDED.coarse, updated_at = CURRENT_TIMESTAMP';
 
     try {
       await pool.query(query, values);
@@ -199,11 +200,15 @@ async function processDump(pool: ReturnType<typeof getPool>) {
         const isPrimary = parts[3]!;
         const lat = parseFloat(parts[4]!);
         const lon = parseFloat(parts[5]!);
+        // Hrubá poloha (najviac 1 desatinné miesto v oboch): zábery z ISS
+        // a družíc. Posudzuje sa z reťazca, číslo by '40.20' a '40.2'
+        // nerozlíšilo. Pozri `coarse` v database.ts.
+        const coarse = COARSE_RE.test(parts[4]!.trim()) && COARSE_RE.test(parts[5]!.trim());
         const type = parts.length > 7 ? parts[7]!.replace(/'/g, '') : '';
 
         if (globe === 'earth' && isPrimary === '1' && type === 'camera' && !isNaN(lat) && !isNaN(lon)) {
           lastGtId = gtId;
-          batch.push({ pageId, lat, lon });
+          batch.push({ pageId, lat, lon, coarse });
           if (batch.length >= BATCH_SIZE) await flushBatch();
         }
       }
