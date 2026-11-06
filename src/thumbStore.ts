@@ -313,17 +313,38 @@ export function clearThumbs(): void {
 // deleteThumbs (ZADANIE.md, step 5).
 
 /**
+ * Store failures during the transition (full disk, locked shard, unreadable
+ * file) are reported at most once a minute, so a lasting problem does not
+ * flood the log on every thumbnail request.
+ */
+let lastStoreErrorReport = 0;
+function reportStoreError(what: string, err: unknown): void {
+  const now = Date.now();
+  if (now - lastStoreErrorReport < 60_000) return;
+  lastStoreErrorReport = now;
+  console.error(`[thumbStore] ${what} failed, serving the legacy file instead: ${err}`);
+}
+
+/**
  * SQLite first, then the old file. A legacy hit is copied into SQLite so it
  * is served from there next time. The legacy file is not deleted here; the
  * migration script does that after verifying the bytes.
+ *
+ * Both SQLite steps are best-effort: when the lookup or the copy fails, a
+ * valid legacy file is still returned. Serving must not depend on the store
+ * being writable.
  */
 export function getThumbOrLegacy(
   pageId: number | string,
   size: number,
   legacyPath: string = getCachePath(pageId, size),
 ): ThumbEntry | undefined {
-  const hit = getThumbEntry(pageId, size);
-  if (hit) return hit;
+  try {
+    const hit = getThumbEntry(pageId, size);
+    if (hit) return hit;
+  } catch (err) {
+    reportStoreError(`SQLite lookup of ${pageId}/${size}`, err);
+  }
   let data: Buffer;
   let updated: number;
   try {
@@ -333,7 +354,11 @@ export function getThumbOrLegacy(
     return undefined;
   }
   if (data.length === 0) return undefined;
-  putThumbIfMissing(pageId, size, data, updated);
+  try {
+    putThumbIfMissing(pageId, size, data, updated);
+  } catch (err) {
+    reportStoreError(`SQLite copy of ${pageId}/${size}`, err);
+  }
   return { data, updated };
 }
 
@@ -343,7 +368,11 @@ export function hasThumbOrLegacy(
   size: number,
   legacyPath: string = getCachePath(pageId, size),
 ): boolean {
-  if (hasThumb(pageId, size)) return true;
+  try {
+    if (hasThumb(pageId, size)) return true;
+  } catch (err) {
+    reportStoreError(`SQLite existence check of ${pageId}/${size}`, err);
+  }
   // Called for every id of a /pictures?prefetch=true response (up to 50 000):
   // no exception for the common "no legacy file" case.
   const st = fs.statSync(legacyPath, { throwIfNoEntry: false });
