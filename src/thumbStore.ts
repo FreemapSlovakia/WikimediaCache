@@ -75,6 +75,14 @@ export interface ThumbRef {
 
 const shards: (Shard | undefined)[] = new Array(SHARD_COUNT);
 
+/**
+ * NORMAL for the server: in WAL mode a commit survives a crash of the process,
+ * and the server never deletes anything a lost commit would leave missing.
+ * The destructive migration switches its own connections to FULL
+ * (useDurableWrites), so its commits survive a power or OS failure too.
+ */
+let synchronousMode: 'NORMAL' | 'FULL' = 'NORMAL';
+
 function toPageId(pageId: number | string): number {
   const n = typeof pageId === 'string' ? Number(pageId) : pageId;
   if (!Number.isSafeInteger(n) || n < 0) throw new Error(`thumbStore: invalid pageId ${pageId}`);
@@ -107,7 +115,7 @@ function openShard(i: number): Shard {
   db.pragma(`page_size = ${PAGE_SIZE}`);
   db.pragma('auto_vacuum = INCREMENTAL');
   db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
+  db.pragma(`synchronous = ${synchronousMode}`);
   db.pragma('busy_timeout = 10000');
   db.pragma('cache_size = -4000');
   db.pragma('mmap_size = 268435456');
@@ -143,6 +151,51 @@ function shard(i: number): Shard {
     shards[i] = s;
   }
   return s;
+}
+
+/** Shard index of a pageId, for callers that group work per shard (durableShards). */
+export function thumbShardIndex(pageId: number | string): number {
+  return shardIndex(pageId);
+}
+
+/**
+ * synchronous=FULL for this process's connections (open ones and future ones).
+ * Only for the migration with --delete-source; the server stays on NORMAL.
+ */
+export function useDurableWrites(): void {
+  synchronousMode = 'FULL';
+  for (const s of shards) s?.db.pragma('synchronous = FULL');
+}
+
+/**
+ * Durability barrier before deleting the source of migrated rows.
+ *
+ * A row that can be read back is not necessarily on disk: with
+ * synchronous=NORMAL it may live only in the -wal file, unsynced, and a power
+ * or OS failure would lose it. Rows the server wrote earlier (INSERT OR IGNORE
+ * then commits nothing new) are in the same situation. A completed
+ * wal_checkpoint(FULL) copies every committed frame into the .db file and
+ * fsyncs it, whoever wrote the frame.
+ *
+ * Returns the shard indices for which the checkpoint completed (busy = 0 and
+ * every WAL frame checkpointed). For any other shard the caller must keep the
+ * source files. Never throws.
+ */
+export function durableShards(shardIndices: Iterable<number>): Set<number> {
+  const ok = new Set<number>();
+  for (const i of new Set(shardIndices)) {
+    try {
+      const [r] = shard(i).db.pragma('wal_checkpoint(FULL)') as {
+        busy: number;
+        log: number;
+        checkpointed: number;
+      }[];
+      if (r && r.busy === 0 && r.log >= 0 && r.checkpointed === r.log) ok.add(i);
+    } catch {
+      // not confirmed -> not in the set
+    }
+  }
+  return ok;
 }
 
 function shardFor(pageId: number | string): Shard {

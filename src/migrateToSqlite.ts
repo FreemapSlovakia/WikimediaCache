@@ -1,9 +1,18 @@
 /**
  * Moves legacy thumbnail files from CACHE_DIR into the SQLite thumb store.
  *
- * Safe to re-run: rows that already exist are kept (INSERT OR IGNORE), and a
- * file is only deleted after its bytes were read back from SQLite and match.
+ * Safe to re-run: rows that already exist are kept (INSERT OR IGNORE). With
+ * --delete-source a file is deleted only after three steps per batch:
+ *   1. inserted (or already present),
+ *   2. verified: its bytes read back from SQLite match the file,
+ *   3. durable: a completed wal_checkpoint(FULL) of its shard put the row into
+ *      the .db file and synced it (thumbStore.durableShards). The migration's
+ *      own connections also run with synchronous=FULL.
+ * A file whose shard could not be made durable stays; the next run picks it up.
  * Can run while the server is up (WAL mode).
+ *
+ * Exit code 3 when anything was left for inspection (mismatch, readErrors,
+ * notDurable), so automation does not have to parse the summary.
  *
  *   npx tsx src/migrateToSqlite.ts --limit 10000      # trial, keeps files
  *   npx tsx src/migrateToSqlite.ts                    # copy all, keep files
@@ -15,7 +24,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CACHE_DIR, getCachePath } from './cachePaths.js';
-import { closeThumbStore, countThumbs, getThumb, putThumbsIfMissing } from './thumbStore.js';
+import {
+  closeThumbStore,
+  countThumbs,
+  durableShards,
+  getThumb,
+  putThumbsIfMissing,
+  thumbShardIndex,
+  useDurableWrites,
+} from './thumbStore.js';
 
 const args = process.argv.slice(2);
 const DELETE_SOURCE = args.includes('--delete-source');
@@ -26,6 +43,7 @@ if (!(LIMIT > 0)) {
   process.exit(2);
 }
 const BATCH = 2000;
+if (DELETE_SOURCE) useDurableWrites();
 
 // Ctrl+C (alebo SIGTERM) nezabije beh uprostred dávky: dokončí sa rozpísaná
 // dávka, vypíše sa súhrn a store sa korektne zatvorí. Druhý Ctrl+C ukončí
@@ -50,6 +68,9 @@ const stats = {
   seen: 0,
   inserted: 0,
   alreadyPresent: 0,
+  verified: 0,
+  durable: 0,
+  notDurable: 0,
   deleted: 0,
   skippedName: 0,
   skippedEmpty: 0,
@@ -118,6 +139,7 @@ async function flush(batch: string[]): Promise<void> {
   stats.alreadyPresent += items.length - inserted;
 
   if (!DELETE_SOURCE) return;
+  const verified: typeof items = [];
   for (const it of items) {
     const stored = getThumb(it.pageId, it.size);
     if (!stored || !stored.equals(it.data)) {
@@ -125,6 +147,18 @@ async function flush(batch: string[]): Promise<void> {
       stats.mismatch++;
       continue;
     }
+    verified.push(it);
+  }
+  stats.verified += verified.length;
+
+  // Durability point: nothing is unlinked before it.
+  const durable = durableShards(verified.map((it) => thumbShardIndex(it.pageId)));
+  for (const it of verified) {
+    if (!durable.has(thumbShardIndex(it.pageId))) {
+      stats.notDurable++;
+      continue;
+    }
+    stats.durable++;
     await fs.promises.unlink(it.file);
     stats.deleted++;
   }
@@ -152,6 +186,10 @@ async function main(): Promise<void> {
   if (skippedSamples.length) console.log('skippedName samples:', skippedSamples.join(', '));
   console.log('Rows in store:', countThumbs());
   closeThumbStore();
+  if (stats.mismatch || stats.readErrors || stats.notDurable) {
+    console.log('Some files were kept for inspection or a re-run (mismatch / readErrors / notDurable), exit code 3.');
+    process.exitCode = 3;
+  }
 }
 
 main().catch((err) => {

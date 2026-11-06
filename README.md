@@ -241,10 +241,10 @@ The old layout was `cache/<shard>/<pageId>_<size>.jpg` with `<shard>` = `pageId 
 
 ```bash
 npx tsx src/migrateToSqlite.ts --limit 10000      # trial, keeps the files
-npx tsx src/migrateToSqlite.ts --delete-source    # copy, read back, compare, delete the file
+npx tsx src/migrateToSqlite.ts --delete-source    # copy, read back, compare, make durable, delete the file
 ```
 
-A file is deleted only after its bytes were read back from SQLite and match. Re-running is safe (existing rows are kept). Ctrl+C finishes the current batch, prints the summary and stops; a second Ctrl+C exits at once. The summary must show `mismatch: 0` and `readErrors: 0`. `skippedName` counts files whose path does not round-trip through `getCachePath()` (junk such as `.DS_Store`, `*.part`, files directly in `cache/` from before sharding, a file in the wrong shard); they are listed (first 20) and never deleted. `skippedEmpty` counts 0-byte files, also kept.
+A file is deleted only after three steps: its row is in SQLite, its bytes were read back and match (`verified`), and its shard passed a durability barrier (`durable`): a completed `wal_checkpoint(FULL)` that copies the WAL into the `.db` file and fsyncs it. Read-back alone is not enough, because with `synchronous=NORMAL` a committed row may exist only in an unsynced `-wal` and a power or OS failure would lose it after the JPEG is already gone. With `--delete-source` the migration's own connections also use `synchronous=FULL`; the server stays on `NORMAL`. The barrier runs once per shard per batch of 2000 files, not per file. When a checkpoint cannot complete (a long reader or writer on the shard for longer than `busy_timeout`, 10 s), the files of that shard stay and are counted as `notDurable`; simply run the migration again. Re-running is safe (existing rows are kept). Ctrl+C finishes the current batch, prints the summary and stops; a second Ctrl+C exits at once. The summary must show `mismatch: 0`, `readErrors: 0` and `notDurable: 0`; otherwise the script exits with code 3. `skippedName` counts files whose path does not round-trip through `getCachePath()` (junk such as `.DS_Store`, `*.part`, files directly in `cache/` from before sharding, a file in the wrong shard); they are listed (first 20) and never deleted. `skippedEmpty` counts 0-byte files, also kept.
 
 Files sitting directly in `cache/` (unsharded leftovers) are skipped; move them into shards first with `npm run migrate-cache-shards` if there are any (`find cache -maxdepth 1 -type f | wc -l`).
 
