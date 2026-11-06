@@ -26,8 +26,18 @@ export const SHARD_COUNT = 64;
 /** Sizes must be 1..SIZE_SLOTS-1 (thumbnail width in px). */
 const SIZE_SLOTS = 4096;
 
-export const THUMB_DB_DIR =
-  process.env.THUMB_DB_DIR || path.join(path.dirname(CACHE_DIR), 'thumbs-db');
+export const THUMB_DB_DIR = path.resolve(
+  process.env.THUMB_DB_DIR || path.join(path.dirname(CACHE_DIR), 'thumbs-db'),
+);
+
+// runFullCleanup() (index.ts) removes every subdirectory of CACHE_DIR; shards
+// inside it would be deleted while open. Same directory is just as bad.
+{
+  const rel = path.relative(CACHE_DIR, THUMB_DB_DIR);
+  if (rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))) {
+    throw new Error(`thumbStore: THUMB_DB_DIR (${THUMB_DB_DIR}) must not be inside CACHE_DIR (${CACHE_DIR})`);
+  }
+}
 
 /**
  * page_size only applies to a new, empty file; changing it later needs VACUUM.

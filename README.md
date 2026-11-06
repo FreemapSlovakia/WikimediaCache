@@ -235,7 +235,7 @@ Why: one file per ~5 KB thumbnail exhausts ext4 inodes (3.7 M files filled 97 % 
 
 Environment variables (also read from `.env`, by every script):
 
-- `THUMB_DB_DIR` - directory of the shard files (default `thumbs-db/`).
+- `THUMB_DB_DIR` - directory of the shard files (default `thumbs-db/`). Must not be inside `CACHE_DIR` (the full wipe removes its subdirectories); the server refuses to start otherwise.
 - `THUMB_DB_PAGE_SIZE` - page size for new shard files (default 4096).
 - `CACHE_DIR` - legacy file cache (default `cache/`), only read during the migration.
 
