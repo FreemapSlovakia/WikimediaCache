@@ -18,6 +18,7 @@ import sharp from 'sharp';
 import crypto from 'crypto';
 import { CACHE_DIR, listCacheFilesRecursive } from './cachePaths.js';
 import { describePlan, planSpatialCleanup } from './spatialCleanup.js';
+import { readMigrationStatus } from './migrationStatus.js';
 import {
   classifyImageInfo,
   isPlaceholder,
@@ -607,7 +608,11 @@ router.get('/status', async (ctx) => {
     // cely /status, presne ako to uz riesi `?.name` o riadok vyssie.
     warmCacheGapMs: currentWarmCacheStage ? resolveStageGapMs(currentWarmCacheStage) : null,
     warmCacheLaps: warmCacheState.laps,
-    warmCacheCursor: warmCacheState.cursor
+    warmCacheCursor: warmCacheState.cursor,
+    // cachedFilesCount / cachedFilesSizeBytes su od presunu do SQLite riadky
+    // a velkost shardov (.db + -wal). Posledny beh migrateToSqlite (alebo
+    // prave beziaci) - null, kym nebezala verzia, ktora subor zapisuje.
+    lastMigration: readMigrationStatus()
   };
 });
 

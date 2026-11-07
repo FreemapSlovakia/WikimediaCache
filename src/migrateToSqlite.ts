@@ -33,6 +33,7 @@ import {
   thumbShardIndex,
   useDurableWrites,
 } from './thumbStore.js';
+import { type MigrationStatus, writeMigrationStatus } from './migrationStatus.js';
 
 const args = process.argv.slice(2);
 const DELETE_SOURCE = args.includes('--delete-source');
@@ -164,9 +165,29 @@ async function flush(batch: string[]): Promise<void> {
   }
 }
 
+const report: MigrationStatus = {
+  state: 'running',
+  pid: process.pid,
+  deleteSource: DELETE_SOURCE,
+  limit: Number.isFinite(LIMIT) ? LIMIT : null,
+  startedAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  stats,
+};
+
+function saveReport(changes: Partial<MigrationStatus>, startedMs: number): void {
+  Object.assign(report, changes);
+  const now = Date.now();
+  report.updatedAt = new Date(now).toISOString();
+  report.perSecond = Math.round(stats.seen / Math.max((now - startedMs) / 1000, 0.001));
+  report.stats = { ...stats };
+  writeMigrationStatus(report);
+}
+
 async function main(): Promise<void> {
   console.log(`Migrating ${CACHE_DIR} -> SQLite (delete source: ${DELETE_SOURCE}, limit: ${LIMIT})`);
   const started = Date.now();
+  saveReport({}, started);
   let batch: string[] = [];
   for await (const file of walk(CACHE_DIR)) {
     if (stats.seen >= LIMIT || stopRequested) break;
@@ -176,24 +197,39 @@ async function main(): Promise<void> {
       await flush(batch);
       batch = [];
       if (stats.seen % 50000 < BATCH) {
-        const rate = stats.seen / ((Date.now() - started) / 1000);
-        console.log(JSON.stringify({ ...stats, perSecond: Math.round(rate) }));
+        saveReport({}, started);
+        console.log(JSON.stringify({ ...stats, perSecond: report.perSecond }));
       }
     }
   }
   if (batch.length) await flush(batch);
   console.log(stopRequested ? 'Stopped early:' : 'Done:', JSON.stringify(stats));
   if (skippedSamples.length) console.log('skippedName samples:', skippedSamples.join(', '));
-  console.log('Rows in store:', countThumbs());
+  const rowsInStore = countThumbs();
+  console.log('Rows in store:', rowsInStore);
   closeThumbStore();
-  if (stats.mismatch || stats.readErrors || stats.notDurable) {
+  const kept = stats.mismatch || stats.readErrors || stats.notDurable;
+  if (kept) {
     console.log('Some files were kept for inspection or a re-run (mismatch / readErrors / notDurable), exit code 3.');
     process.exitCode = 3;
   }
+  saveReport(
+    {
+      state: stopRequested ? 'stopped' : 'done',
+      finishedAt: new Date().toISOString(),
+      exitCode: kept ? 3 : 0,
+      rowsInStore,
+    },
+    started,
+  );
 }
 
 main().catch((err) => {
   console.error(err);
   closeThumbStore();
+  saveReport(
+    { state: 'failed', finishedAt: new Date().toISOString(), exitCode: 1, error: String(err) },
+    Date.parse(report.startedAt),
+  );
   process.exit(1);
 });
